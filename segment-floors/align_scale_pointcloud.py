@@ -193,7 +193,7 @@ pcd_down = orig_pcd.voxel_down_sample(voxel_size=0.05)
 
 print("\nDetecting dominant plane via RANSAC ...")
 
-MAX_PLANE_ATTEMPTS = 5
+MAX_PLANE_ATTEMPTS = 10
 ANGLE_THRESHOLD    = 20.0
 
 candidate  = pcd_down

@@ -5,7 +5,7 @@
 #SBATCH --chdir=/cluster/project/cvg/students/xinwei/housetour-ext
 #SBATCH --cpus-per-task=4
 #SBATCH --mem-per-cpu=16G
-#SBATCH --time=8:00:00
+#SBATCH --time=24:00:00
 #SBATCH --gpus=1
 
 # Usage:
