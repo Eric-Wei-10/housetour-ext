@@ -166,7 +166,7 @@ def visible_point_mask(pts: np.ndarray, qvec, tvec, width, height, fx, fy, cx, c
     R = Rotation.from_quat([qx, qy, qz, qw]).as_matrix()
     pts_cam  = pts @ R.T + tvec             # (N, 3) — world → camera space
     z        = pts_cam[:, 2]
-    in_front = z > 0.05
+    in_front = z > 1e-3
     safe_z   = np.where(in_front, z, 1.0)  # avoid division by near-zero
     u = fx * pts_cam[:, 0] / safe_z + cx
     v = fy * pts_cam[:, 1] / safe_z + cy
@@ -274,6 +274,11 @@ with server.gui.add_folder("Segments"):
 # ---------------------------------------------------------------------------
 print("Adding camera frustums ...")
 
+# Per-frustum properties needed to restore colour after deselection
+name_to_frustum_props: dict[str, dict] = {}
+# Mutable box so click-handler closures can update the selected name
+_selection: dict[str, str | None] = {"name": None}
+
 for i, entry in enumerate(entries):
     sid = name_to_seg.get(entry["name"], -1)
     if sid == -1:
@@ -288,18 +293,40 @@ for i, entry in enumerate(entries):
 
     # COLMAP qvec is R_cw (world→camera); viser wxyz expects R_wc (camera→world).
     # Invert by conjugating the quaternion: (qw, -qx, -qy, -qz).
+    frustum_name = f"/cameras/{entry['name']}"
+    frustum_wxyz = (qw, -qx, -qy, -qz)
+    frustum_pos  = tuple(center)
+    name_to_frustum_props[frustum_name] = dict(
+        color=color, wxyz=frustum_wxyz, position=frustum_pos)
     handle = server.scene.add_camera_frustum(
-        name     = f"/cameras/{entry['name']}",
+        name     = frustum_name,
         fov      = float(np.deg2rad(60)),
         aspect   = 4 / 3,
         scale    = 0.08,
         color    = color,
-        wxyz     = (qw, -qx, -qy, -qz),
-        position = tuple(center),
+        wxyz     = frustum_wxyz,
+        position = frustum_pos,
     )
 
-    def make_click_handler(name, path, segment_id, label_idx, qvec, tvec, cam_id):
+    def make_click_handler(name, path, segment_id, label_idx, qvec, tvec, cam_id,
+                           fname):
         def on_click(_):
+            # Restore previously selected frustum to its original colour
+            prev = _selection["name"]
+            if prev is not None and prev in name_to_frustum_props:
+                p = name_to_frustum_props[prev]
+                server.scene.add_camera_frustum(
+                    name=prev, fov=float(np.deg2rad(60)), aspect=4/3,
+                    scale=0.08, color=p["color"],
+                    wxyz=p["wxyz"], position=p["position"])
+            # Highlight the newly selected frustum
+            _selection["name"] = fname
+            p = name_to_frustum_props[fname]
+            server.scene.add_camera_frustum(
+                name=fname, fov=float(np.deg2rad(60)), aspect=4/3,
+                scale=0.13, color=(255, 255, 255),
+                wxyz=p["wxyz"], position=p["position"])
+
             color_hex = rgb_to_hex(SEG_PALETTE[segment_id])
             gui_frame_label.content = (
                 f'<span style="color:{color_hex}">&#9632;</span> '
@@ -326,7 +353,8 @@ for i, entry in enumerate(entries):
     handle.on_click(make_click_handler(
         entry["name"], KF_DIR / entry["name"], sid,
         name_to_label.get(entry["name"], -1),
-        entry["qvec"], entry["tvec"], entry["cam_id"]))
+        entry["qvec"], entry["tvec"], entry["cam_id"],
+        frustum_name))
 
 print(f"Added {len(entries) // args.every_n} frustums.")
 
@@ -353,7 +381,7 @@ if ply_path.exists():
         clrs_all  = clrs
         pcd_loaded = True
         # Background layer: dimmed to 30% so highlighted points stand out
-        clrs_dim = (clrs * 0.30).astype(np.uint8)
+        clrs_dim = (clrs * 0.20).astype(np.uint8)
         server.scene.add_point_cloud(
             name="point_cloud/bg", points=pts, colors=clrs_dim, point_size=0.008)
         # Highlight layer: starts empty, updated on each frustum click
