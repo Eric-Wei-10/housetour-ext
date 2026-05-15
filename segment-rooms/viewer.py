@@ -22,6 +22,7 @@ from pathlib import Path
 
 import numpy as np
 from PIL import Image
+from scipy.ndimage import minimum_filter
 from scipy.spatial.transform import Rotation
 import viser
 
@@ -51,13 +52,9 @@ KF_DIR    = SCENE_DIR / "keyframes"
 SEG_JSON   = SEG_DIR / "segments.json"
 LABELS_NPY = SEG_DIR / "room_labels.npy"
 
-for candidate in ("0_aligned", "0_metric", "0"):
-    IMAGES_BIN = SCENE_DIR / candidate / "images.bin"
-    if IMAGES_BIN.exists():
-        print(f"Using poses from {candidate}/images.bin")
-        break
-else:
-    raise FileNotFoundError(f"No images.bin found under {SCENE_DIR}")
+IMAGES_BIN = SCENE_DIR / "0_metric" / "images.bin"
+if not IMAGES_BIN.exists():
+    raise FileNotFoundError(f"No 0_metric/images.bin found under {SCENE_DIR}")
 
 CAMERAS_BIN = IMAGES_BIN.parent / "cameras.bin"
 
@@ -153,21 +150,43 @@ def room_name(label_idx):
         return HOUSE_ROOM_TYPES[label_idx]
     return "unknown"
 
-def visible_point_mask(pts: np.ndarray, qvec, tvec, width, height, fx, fy, cx, cy) -> np.ndarray:
-    """Boolean mask of pts (N,3) that project inside this camera's image plane.
+def visible_point_mask(pts: np.ndarray, qvec, tvec, width, height, fx, fy, cx, cy,
+                       depth_eps: float = 0.15, dilation: int = 9) -> np.ndarray:
+    """Boolean mask of pts (N,3) visible from this camera.
 
-    Uses pinhole projection (P_cam = R @ P_world + t) and ignores lens distortion,
-    which is fine for an approximate visibility highlight.
+    Uses pinhole projection + approximate Z-buffer with dilation:
+      1. Project all points into image space.
+      2. Build depth buffer D[v,u] = min z over all points landing on that pixel.
+      3. Dilate D with a minimum_filter of size `dilation` to fill holes caused
+         by sparse point cloud sampling (propagates near-surface depths into
+         empty neighbouring pixels so behind-wall points don't leak through).
+      4. A point is visible only if z <= D[v,u] + depth_eps.
     """
     qw, qx, qy, qz = qvec
     R = Rotation.from_quat([qx, qy, qz, qw]).as_matrix()
-    pts_cam = pts @ R.T + tvec              # (N, 3) — world → camera space
-    z       = pts_cam[:, 2]
+    pts_cam  = pts @ R.T + tvec             # (N, 3) — world → camera space
+    z        = pts_cam[:, 2]
     in_front = z > 0.05
     safe_z   = np.where(in_front, z, 1.0)  # avoid division by near-zero
     u = fx * pts_cam[:, 0] / safe_z + cx
     v = fy * pts_cam[:, 1] / safe_z + cy
-    return in_front & (u >= 0) & (u < width) & (v >= 0) & (v < height)
+
+    ui = np.round(u).astype(np.int32)
+    vi = np.round(v).astype(np.int32)
+    in_bounds = in_front & (ui >= 0) & (ui < width) & (vi >= 0) & (vi < height)
+
+    # Build depth buffer: for each pixel, record the nearest point's z
+    depth_buf = np.full((height, width), np.inf, dtype=np.float64)
+    idx = np.where(in_bounds)[0]
+    np.minimum.at(depth_buf, (vi[idx], ui[idx]), z[idx])
+
+    # Dilate: propagate near-surface depths into empty neighbouring pixels
+    depth_buf = minimum_filter(depth_buf, size=dilation)
+
+    # Depth test: visible if z is within depth_eps of the nearest point at that pixel
+    visible = np.zeros(len(pts), dtype=bool)
+    visible[idx] = z[idx] <= depth_buf[vi[idx], ui[idx]] + depth_eps
+    return visible
 
 # ---------------------------------------------------------------------------
 # Load data
@@ -319,35 +338,33 @@ pts_all:  np.ndarray | None = None
 clrs_all: np.ndarray | None = None
 pcd_loaded = False
 
-for ply_name in (f"{args.scene_id}_metric.ply", f"{args.scene_id}_pointcloud.ply"):
-    ply_path = SCENE_DIR / ply_name
-    if ply_path.exists():
-        try:
-            import open3d as o3d
-            pcd  = o3d.io.read_point_cloud(str(ply_path))
-            pts  = np.asarray(pcd.points, dtype=np.float64)   # (N, 3) world coords
-            clrs = (np.asarray(pcd.colors) * 255).astype(np.uint8) if pcd.has_colors() \
-                   else np.full((len(pts), 3), 180, dtype=np.uint8)  # (N, 3) RGB 0-255
-            if len(pts) > 900_000:
-                idx  = np.random.choice(len(pts), 900_000, replace=False)
-                pts, clrs = pts[idx], clrs[idx]
-            pts_all   = pts
-            clrs_all  = clrs
-            pcd_loaded = True
-            # Background layer: dimmed to 30% so highlighted points stand out
-            clrs_dim = (clrs * 0.30).astype(np.uint8)
-            server.scene.add_point_cloud(
-                name="point_cloud/bg", points=pts, colors=clrs_dim, point_size=0.008)
-            # Highlight layer: starts empty, updated on each frustum click
-            server.scene.add_point_cloud(
-                name="point_cloud/hi",
-                points=np.zeros((0, 3), dtype=np.float64),
-                colors=np.zeros((0, 3), dtype=np.uint8),
-                point_size=0.014)
-            print(f"Loaded point cloud: {ply_name} ({len(pts)} pts)")
-        except Exception as e:
-            print(f"Could not load point cloud: {e}")
-        break
+ply_path = SCENE_DIR / f"{args.scene_id}_metric.ply"
+if ply_path.exists():
+    try:
+        import open3d as o3d
+        pcd  = o3d.io.read_point_cloud(str(ply_path))
+        pts  = np.asarray(pcd.points, dtype=np.float64)   # (N, 3) world coords
+        clrs = (np.asarray(pcd.colors) * 255).astype(np.uint8) if pcd.has_colors() \
+               else np.full((len(pts), 3), 180, dtype=np.uint8)  # (N, 3) RGB 0-255
+        if len(pts) > 3_000_000:
+            idx  = np.random.choice(len(pts), 3_000_000, replace=False)
+            pts, clrs = pts[idx], clrs[idx]
+        pts_all   = pts
+        clrs_all  = clrs
+        pcd_loaded = True
+        # Background layer: dimmed to 30% so highlighted points stand out
+        clrs_dim = (clrs * 0.30).astype(np.uint8)
+        server.scene.add_point_cloud(
+            name="point_cloud/bg", points=pts, colors=clrs_dim, point_size=0.008)
+        # Highlight layer: starts empty, updated on each frustum click
+        server.scene.add_point_cloud(
+            name="point_cloud/hi",
+            points=np.zeros((0, 3), dtype=np.float64),
+            colors=np.zeros((0, 3), dtype=np.uint8),
+            point_size=0.014)
+        print(f"Loaded point cloud: {ply_path.name} ({len(pts)} pts)")
+    except Exception as e:
+        print(f"Could not load point cloud: {e}")
 
 # ---------------------------------------------------------------------------
 # Keep alive

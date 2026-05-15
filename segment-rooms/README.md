@@ -65,10 +65,10 @@ Interactive 3D segment viewer built with [viser](https://viser.studio). Renders
 one camera frustum per keyframe, coloured by segment ID. Click a frustum to
 preview the corresponding keyframe image.
 
-> **Note:** The point-cloud highlight on frustum click uses a simple pinhole
-> visibility check (projects all points and keeps those inside the image plane).
-> It does **not** filter occluded points — a point behind geometry may still be
-> highlighted if it projects inside the frustum bounds.
+> **Note:** The point-cloud highlight on frustum click uses pinhole projection
+> with an approximate Z-buffer (depth buffer + dilation) to suppress occluded
+> points. Occlusion culling is approximate — sparse areas of the point cloud
+> may still let some behind-wall points through.
 
 ```bash
 python segment-rooms/viewer.py --scene_id 7 [--port 8080] [--every_n 2]
