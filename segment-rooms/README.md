@@ -6,8 +6,14 @@ type and splits the sequence into per-room segments.
 ## Pipeline
 
 ```
-segment_rooms  →  refine_vlm
+                 ┌─ refine_vlm      (approach A)
+segment_rooms  ──┤
+                 └─ probe_multi_bed (approach B)
 ```
+
+`refine_vlm` and `probe_multi_bed` are two independent approaches to the same
+problem — splitting under-segmented adjacent bedrooms. They are being evaluated
+in parallel; only one will be used in the final pipeline.
 
 ### 1. `segment_rooms.py` / `segment_rooms.sh`
 
@@ -55,6 +61,29 @@ sbatch ./segment-rooms/refine_vlm.sh 14
 sbatch ./segment-rooms/refine_vlm.sh 11 14 1002
 sbatch ./segment-rooms/refine_vlm.sh 100-200
 sbatch ./segment-rooms/refine_vlm.sh 14 --n_frames 12 --dry_run
+```
+
+### 3. `probe_multi_bed.py` / `probe_multi_bed.sh`
+
+Second-pass bedroom post-processing. The SigLIP pipeline often fails to separate
+two adjacent bedrooms, merging them into one segment. This script uses
+Qwen2.5-VL-7B to detect and split such cases.
+
+For each bedroom segment:
+1. Ask the VLM per-frame: how many beds are visible, and (if multiple) are they
+   in the same room or different rooms?
+2. Apply two-pass label smoothing to suppress per-frame noise.
+3. Recursively scan for runs of `multiple`-bed frames. For each run, vote using
+   only the raw-`multiple` frames: if `different` strictly outvotes `same`, the
+   run is a transition boundary — drop those frames and split the segment.
+4. Each resulting sub-segment must have ≥ 5 frames to be kept.
+
+`--dry_run` runs the full analysis and prints the log without writing to JSON.
+
+```bash
+sbatch ./segment-rooms/probe_multi_bed.sh 7 --dry_run
+sbatch ./segment-rooms/probe_multi_bed.sh 7 --out_dir /tmp/probe
+sbatch ./segment-rooms/probe_multi_bed.sh 1-200 --out_dir /tmp/probe
 ```
 
 ## Viewer

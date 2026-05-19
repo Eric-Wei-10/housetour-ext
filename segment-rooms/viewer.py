@@ -20,6 +20,8 @@ import json
 import struct
 from pathlib import Path
 
+import time
+
 import numpy as np
 from PIL import Image
 from scipy.ndimage import minimum_filter
@@ -44,6 +46,10 @@ parser.add_argument("--seg_root",  default="/cluster/project/cvg/students/xinwei
                                            "official-housetour-dataset/label_segments")
 parser.add_argument("--every_n",   type=int, default=1,
                     help="Show every N-th frustum (use >1 to reduce clutter)")
+parser.add_argument("--highlight_mode", default="zbuffer",
+                    choices=["zbuffer", "colmap"],
+                    help="zbuffer: project dense PLY with Z-buffer occlusion; "
+                         "colmap: highlight sparse points observed in this image")
 args = parser.parse_args()
 
 SCENE_DIR = Path(args.data_root) / args.scene_id
@@ -56,12 +62,13 @@ IMAGES_BIN = SCENE_DIR / "0_metric" / "images.bin"
 if not IMAGES_BIN.exists():
     raise FileNotFoundError(f"No 0_metric/images.bin found under {SCENE_DIR}")
 
-CAMERAS_BIN = IMAGES_BIN.parent / "cameras.bin"
+CAMERAS_BIN  = IMAGES_BIN.parent / "cameras.bin"
+POINTS3D_BIN = IMAGES_BIN.parent / "points3D.bin"
 
 # ---------------------------------------------------------------------------
 # COLMAP reader
 # ---------------------------------------------------------------------------
-def read_images_bin(path):
+def read_images_bin(path, read_pts2d: bool = False):
     images = {}
     with open(path, "rb") as f:
         n = struct.unpack("<Q", f.read(8))[0]
@@ -76,12 +83,37 @@ def read_images_bin(path):
                 if c == b"\x00": break
                 name += c
             n2 = struct.unpack("<Q", f.read(8))[0]
-            f.read(24 * n2)
+            if read_pts2d:
+                point3d_ids = []
+                for _ in range(n2):
+                    f.read(16)  # x2, y2 (unused)
+                    pid = struct.unpack("<q", f.read(8))[0]
+                    if pid >= 0:
+                        point3d_ids.append(pid)
+            else:
+                f.read(24 * n2)
+                point3d_ids = None
             images[iid] = dict(name=name.decode(),
                                qvec=np.array([qw, qx, qy, qz]),
                                tvec=np.array([tx, ty, tz]),
-                               cam_id=cam_id)
+                               cam_id=cam_id,
+                               point3d_ids=point3d_ids)
     return sorted(images.values(), key=lambda x: x["name"])
+
+def read_points3d_bin(path):
+    """Returns {point3D_id: (xyz np.float64 (3,), rgb np.uint8 (3,))}."""
+    points = {}
+    with open(path, "rb") as f:
+        n = struct.unpack("<Q", f.read(8))[0]
+        for _ in range(n):
+            pid     = struct.unpack("<Q", f.read(8))[0]
+            xyz     = np.array(struct.unpack("<3d", f.read(24)), dtype=np.float64)
+            rgb     = np.array(struct.unpack("<3B", f.read(3)),  dtype=np.uint8)
+            f.read(8)   # error
+            n_track = struct.unpack("<Q", f.read(8))[0]
+            f.read(8 * n_track)  # track elements (image_id, point2D_idx)
+            points[pid] = (xyz, rgb)
+    return points
 
 # ---------------------------------------------------------------------------
 # COLMAP cameras reader
@@ -192,13 +224,32 @@ def visible_point_mask(pts: np.ndarray, qvec, tvec, width, height, fx, fy, cx, c
 # Load data
 # ---------------------------------------------------------------------------
 print("Loading poses ...")
-entries = read_images_bin(IMAGES_BIN)
+entries = read_images_bin(IMAGES_BIN,
+                          read_pts2d=(args.highlight_mode == "colmap"))
 print(f"  {len(entries)} registered frames")
 
 cameras: dict = {}
 if CAMERAS_BIN.exists():
     cameras = read_cameras_bin(CAMERAS_BIN)
     print(f"  {len(cameras)} camera model(s) loaded from cameras.bin")
+
+# colmap mode: pre-compute per-frame sparse point arrays from points3D.bin
+name_to_sparse_pts: dict[str, tuple[np.ndarray, np.ndarray]] = {}
+if args.highlight_mode == "colmap":
+    if not POINTS3D_BIN.exists():
+        print(f"  [warn] points3D.bin not found — colmap highlight unavailable")
+    else:
+        print("Loading points3D.bin for colmap highlight mode ...")
+        points3d = read_points3d_bin(POINTS3D_BIN)
+        for entry in entries:
+            ids = entry.get("point3d_ids") or []
+            valid = [points3d[pid] for pid in ids if pid in points3d]
+            if valid:
+                name_to_sparse_pts[entry["name"]] = (
+                    np.array([v[0] for v in valid], dtype=np.float64),
+                    np.array([v[1] for v in valid], dtype=np.uint8),
+                )
+        print(f"  {len(name_to_sparse_pts)} frames have sparse point observations")
 
 print("Loading room labels ...")
 room_labels = np.load(LABELS_NPY)   # shape (N,), one label per keyframe in sequence order
@@ -274,10 +325,50 @@ with server.gui.add_folder("Segments"):
 # ---------------------------------------------------------------------------
 print("Adding camera frustums ...")
 
-# Per-frustum properties needed to restore colour after deselection
-name_to_frustum_props: dict[str, dict] = {}
-# Mutable box so click-handler closures can update the selected name
-_selection: dict[str, str | None] = {"name": None}
+# name → overlay frustum handle (white highlight frustum on top of original)
+selected_handles: dict[str, object] = {}
+# name → point mask (zbuffer) or (pts, clrs) tuple (colmap) for selected frames
+selected_pts: dict[str, object] = {}
+# double-click detection: name, time, and state-before-first-click
+_last_click: dict = {"name": "", "time": 0.0, "was_selected": False}
+# frame name → (qvec, tvec, cam_id, wxyz, pos) for segment-level selection
+name_to_props: dict[str, dict] = {}
+# segment_id → list of frame names that have frustums
+seg_to_names: dict[int, list[str]] = {}
+
+def _compute_and_store_pts(name, qvec, tvec, cam_id):
+    """Compute visible point data for one frame and store in selected_pts."""
+    if args.highlight_mode == "colmap":
+        if name in name_to_sparse_pts:
+            selected_pts[name] = name_to_sparse_pts[name]
+    elif pcd_loaded and cam_id in cameras:
+        cam = cameras[cam_id]
+        selected_pts[name] = visible_point_mask(
+            pts_all, qvec, tvec,
+            cam["width"], cam["height"],
+            cam["fx"], cam["fy"], cam["cx"], cam["cy"])
+
+def refresh_highlight():
+    """Recompute and update point_cloud/hi from all currently selected frames."""
+    if not selected_pts:
+        server.scene.add_point_cloud(
+            name="point_cloud/hi",
+            points=np.zeros((0, 3), dtype=np.float64),
+            colors=np.zeros((0, 3), dtype=np.uint8),
+            point_size=0.014)
+        return
+    if args.highlight_mode == "colmap":
+        all_pts  = np.concatenate([v[0] for v in selected_pts.values()], axis=0)
+        all_clrs = np.concatenate([v[1] for v in selected_pts.values()], axis=0)
+        server.scene.add_point_cloud(
+            name="point_cloud/hi", points=all_pts, colors=all_clrs, point_size=0.02)
+    else:
+        cum_mask = np.zeros(len(pts_all), dtype=bool)
+        for mask in selected_pts.values():
+            cum_mask |= mask
+        server.scene.add_point_cloud(
+            name="point_cloud/hi",
+            points=pts_all[cum_mask], colors=clrs_all[cum_mask], point_size=0.014)
 
 for i, entry in enumerate(entries):
     sid = name_to_seg.get(entry["name"], -1)
@@ -293,13 +384,14 @@ for i, entry in enumerate(entries):
 
     # COLMAP qvec is R_cw (world→camera); viser wxyz expects R_wc (camera→world).
     # Invert by conjugating the quaternion: (qw, -qx, -qy, -qz).
-    frustum_name = f"/cameras/{entry['name']}"
     frustum_wxyz = (qw, -qx, -qy, -qz)
     frustum_pos  = tuple(center)
-    name_to_frustum_props[frustum_name] = dict(
-        color=color, wxyz=frustum_wxyz, position=frustum_pos)
+    name_to_props[entry["name"]] = dict(
+        qvec=entry["qvec"], tvec=entry["tvec"], cam_id=entry["cam_id"],
+        wxyz=frustum_wxyz, pos=frustum_pos)
+    seg_to_names.setdefault(sid, []).append(entry["name"])
     handle = server.scene.add_camera_frustum(
-        name     = frustum_name,
+        name     = f"/cameras/{entry['name']}",
         fov      = float(np.deg2rad(60)),
         aspect   = 4 / 3,
         scale    = 0.08,
@@ -309,24 +401,8 @@ for i, entry in enumerate(entries):
     )
 
     def make_click_handler(name, path, segment_id, label_idx, qvec, tvec, cam_id,
-                           fname):
+                           wxyz, pos):
         def on_click(_):
-            # Restore previously selected frustum to its original colour
-            prev = _selection["name"]
-            if prev is not None and prev in name_to_frustum_props:
-                p = name_to_frustum_props[prev]
-                server.scene.add_camera_frustum(
-                    name=prev, fov=float(np.deg2rad(60)), aspect=4/3,
-                    scale=0.08, color=p["color"],
-                    wxyz=p["wxyz"], position=p["position"])
-            # Highlight the newly selected frustum
-            _selection["name"] = fname
-            p = name_to_frustum_props[fname]
-            server.scene.add_camera_frustum(
-                name=fname, fov=float(np.deg2rad(60)), aspect=4/3,
-                scale=0.13, color=(255, 255, 255),
-                wxyz=p["wxyz"], position=p["position"])
-
             color_hex = rgb_to_hex(SEG_PALETTE[segment_id])
             gui_frame_label.content = (
                 f'<span style="color:{color_hex}">&#9632;</span> '
@@ -335,26 +411,69 @@ for i, entry in enumerate(entries):
                 f'Room: <b>{room_name(label_idx)}</b>'
             )
             gui_image.image = load_image_array(path)
-            # Highlight points visible from this camera
-            if pcd_loaded and cam_id in cameras:
-                cam = cameras[cam_id]
-                mask = visible_point_mask(
-                    pts_all, qvec, tvec,
-                    cam["width"], cam["height"],
-                    cam["fx"], cam["fy"], cam["cx"], cam["cy"],
-                )
-                server.scene.add_point_cloud(
-                    name="point_cloud/hi",
-                    points=pts_all[mask],
-                    colors=clrs_all[mask],
-                    point_size=0.014)
+
+            now = time.time()
+            is_double = (_last_click["name"] == name and
+                         now - _last_click["time"] < 0.5)
+            # Record state BEFORE this click only on first click, so that the
+            # double-click handler knows the original pre-first-click state.
+            if not is_double:
+                _last_click["was_selected"] = (name in selected_handles)
+            _last_click["name"] = name
+            _last_click["time"] = now
+
+            def _add_selected(n, p_qvec, p_tvec, p_cam_id, p_pos):
+                h = server.scene.add_icosphere(
+                    name=f"/selected/{n}",
+                    radius=0.05, color=(255, 220, 0),
+                    position=p_pos)
+                selected_handles[n] = h
+                _compute_and_store_pts(n, p_qvec, p_tvec, p_cam_id)
+
+            def _remove_selected(n):
+                selected_handles.pop(n).remove()
+                selected_pts.pop(n, None)
+
+            if is_double:
+                # Undo the first-click single-toggle before applying segment toggle
+                if _last_click["was_selected"]:
+                    # First click deselected name → re-add it
+                    if name not in selected_handles and name in name_to_props:
+                        p = name_to_props[name]
+                        _add_selected(name, p["qvec"], p["tvec"],
+                                      p["cam_id"], p["pos"])
+                else:
+                    # First click selected name → remove it
+                    if name in selected_handles:
+                        _remove_selected(name)
+
+                # Now toggle entire segment based on restored state
+                seg_names = seg_to_names.get(segment_id, [])
+                all_selected = all(n in selected_handles for n in seg_names)
+                for n in seg_names:
+                    if all_selected:
+                        if n in selected_handles:
+                            _remove_selected(n)
+                    else:
+                        if n not in selected_handles and n in name_to_props:
+                            p = name_to_props[n]
+                            _add_selected(n, p["qvec"], p["tvec"],
+                                          p["cam_id"], p["pos"])
+            else:
+                # Single click: toggle this frustum
+                if name in selected_handles:
+                    _remove_selected(name)
+                else:
+                    _add_selected(name, qvec, tvec, cam_id, pos)
+
+            refresh_highlight()
         return on_click
 
     handle.on_click(make_click_handler(
         entry["name"], KF_DIR / entry["name"], sid,
         name_to_label.get(entry["name"], -1),
         entry["qvec"], entry["tvec"], entry["cam_id"],
-        frustum_name))
+        frustum_wxyz, frustum_pos))
 
 print(f"Added {len(entries) // args.every_n} frustums.")
 
@@ -374,7 +493,7 @@ if ply_path.exists():
         pts  = np.asarray(pcd.points, dtype=np.float64)   # (N, 3) world coords
         clrs = (np.asarray(pcd.colors) * 255).astype(np.uint8) if pcd.has_colors() \
                else np.full((len(pts), 3), 180, dtype=np.uint8)  # (N, 3) RGB 0-255
-        if len(pts) > 3_000_000:
+        if args.highlight_mode == "zbuffer" and len(pts) > 3_000_000:
             idx  = np.random.choice(len(pts), 3_000_000, replace=False)
             pts, clrs = pts[idx], clrs[idx]
         pts_all   = pts
