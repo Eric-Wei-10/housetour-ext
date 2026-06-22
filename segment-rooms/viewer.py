@@ -22,9 +22,13 @@ from pathlib import Path
 
 import time
 
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 import numpy as np
 from PIL import Image
-from scipy.ndimage import minimum_filter
+from scipy.sparse import coo_matrix
+from scipy.sparse.csgraph import connected_components
 from scipy.spatial.transform import Rotation
 import viser
 
@@ -46,10 +50,13 @@ parser.add_argument("--seg_root",  default="/cluster/project/cvg/students/xinwei
                                            "official-housetour-dataset/label_segments")
 parser.add_argument("--every_n",   type=int, default=1,
                     help="Show every N-th frustum (use >1 to reduce clutter)")
-parser.add_argument("--highlight_mode", default="zbuffer",
-                    choices=["zbuffer", "colmap"],
-                    help="zbuffer: project dense PLY with Z-buffer occlusion; "
-                         "colmap: highlight sparse points observed in this image")
+parser.add_argument("--double_click_mode", default="dense",
+                    choices=["dense", "sparse"],
+                    help="dense: voxel-grid search for dense PLY points near the "
+                         "segment's points3D.bin observations; "
+                         "sparse: show the segment's points3D.bin points directly")
+parser.add_argument("--max_display_pts", type=int, default=1,
+                    help="Max points in initial/reset view (0 = no limit)")
 args = parser.parse_args()
 
 SCENE_DIR = Path(args.data_root) / args.scene_id
@@ -62,7 +69,6 @@ IMAGES_BIN = SCENE_DIR / "0_metric" / "images.bin"
 if not IMAGES_BIN.exists():
     raise FileNotFoundError(f"No 0_metric/images.bin found under {SCENE_DIR}")
 
-CAMERAS_BIN  = IMAGES_BIN.parent / "cameras.bin"
 POINTS3D_BIN = IMAGES_BIN.parent / "points3D.bin"
 
 # ---------------------------------------------------------------------------
@@ -101,7 +107,7 @@ def read_images_bin(path, read_pts2d: bool = False):
     return sorted(images.values(), key=lambda x: x["name"])
 
 def read_points3d_bin(path):
-    """Returns {point3D_id: (xyz np.float64 (3,), rgb np.uint8 (3,))}."""
+    """Returns {point3D_id: (xyz, rgb, error, n_track)}."""
     points = {}
     with open(path, "rb") as f:
         n = struct.unpack("<Q", f.read(8))[0]
@@ -109,39 +115,11 @@ def read_points3d_bin(path):
             pid     = struct.unpack("<Q", f.read(8))[0]
             xyz     = np.array(struct.unpack("<3d", f.read(24)), dtype=np.float64)
             rgb     = np.array(struct.unpack("<3B", f.read(3)),  dtype=np.uint8)
-            f.read(8)   # error
+            error   = struct.unpack("<d", f.read(8))[0]
             n_track = struct.unpack("<Q", f.read(8))[0]
-            f.read(8 * n_track)  # track elements (image_id, point2D_idx)
-            points[pid] = (xyz, rgb)
+            f.read(8 * n_track)
+            points[pid] = (xyz, rgb, error, n_track)
     return points
-
-# ---------------------------------------------------------------------------
-# COLMAP cameras reader
-# ---------------------------------------------------------------------------
-# Maps COLMAP model_id → number of parameter doubles in cameras.bin
-_CAM_MODEL_NPARAMS = {0: 3, 1: 4, 2: 4, 3: 5, 4: 8, 5: 8, 6: 12}
-
-def read_cameras_bin(path):
-    cameras = {}
-    with open(path, "rb") as f:
-        n = struct.unpack("<Q", f.read(8))[0]
-        for _ in range(n):
-            cid      = struct.unpack("<I", f.read(4))[0]
-            model_id = struct.unpack("<i", f.read(4))[0]
-            width    = struct.unpack("<Q", f.read(8))[0]
-            height   = struct.unpack("<Q", f.read(8))[0]
-            np_      = _CAM_MODEL_NPARAMS.get(model_id, 4)
-            params   = struct.unpack(f"<{np_}d", f.read(8 * np_))
-            # model 1 (PINHOLE): fx fy cx cy
-            # all others: f cx cy [distortion…]  — use f for both fx and fy
-            if model_id == 1:
-                fx, fy, cx, cy = params[:4]
-            else:
-                fx = fy = params[0]
-                cx, cy = params[1], params[2]
-            cameras[cid] = dict(width=int(width), height=int(height),
-                                fx=fx, fy=fy, cx=cx, cy=cy)
-    return cameras
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -182,74 +160,34 @@ def room_name(label_idx):
         return HOUSE_ROOM_TYPES[label_idx]
     return "unknown"
 
-def visible_point_mask(pts: np.ndarray, qvec, tvec, width, height, fx, fy, cx, cy,
-                       depth_eps: float = 0.15, dilation: int = 9) -> np.ndarray:
-    """Boolean mask of pts (N,3) visible from this camera.
-
-    Uses pinhole projection + approximate Z-buffer with dilation:
-      1. Project all points into image space.
-      2. Build depth buffer D[v,u] = min z over all points landing on that pixel.
-      3. Dilate D with a minimum_filter of size `dilation` to fill holes caused
-         by sparse point cloud sampling (propagates near-surface depths into
-         empty neighbouring pixels so behind-wall points don't leak through).
-      4. A point is visible only if z <= D[v,u] + depth_eps.
-    """
-    qw, qx, qy, qz = qvec
-    R = Rotation.from_quat([qx, qy, qz, qw]).as_matrix()
-    pts_cam  = pts @ R.T + tvec             # (N, 3) — world → camera space
-    z        = pts_cam[:, 2]
-    in_front = z > 1e-3
-    safe_z   = np.where(in_front, z, 1.0)  # avoid division by near-zero
-    u = fx * pts_cam[:, 0] / safe_z + cx
-    v = fy * pts_cam[:, 1] / safe_z + cy
-
-    ui = np.round(u).astype(np.int32)
-    vi = np.round(v).astype(np.int32)
-    in_bounds = in_front & (ui >= 0) & (ui < width) & (vi >= 0) & (vi < height)
-
-    # Build depth buffer: for each pixel, record the nearest point's z
-    depth_buf = np.full((height, width), np.inf, dtype=np.float64)
-    idx = np.where(in_bounds)[0]
-    np.minimum.at(depth_buf, (vi[idx], ui[idx]), z[idx])
-
-    # Dilate: propagate near-surface depths into empty neighbouring pixels
-    depth_buf = minimum_filter(depth_buf, size=dilation)
-
-    # Depth test: visible if z is within depth_eps of the nearest point at that pixel
-    visible = np.zeros(len(pts), dtype=bool)
-    visible[idx] = z[idx] <= depth_buf[vi[idx], ui[idx]] + depth_eps
-    return visible
-
 # ---------------------------------------------------------------------------
 # Load data
 # ---------------------------------------------------------------------------
 print("Loading poses ...")
-entries = read_images_bin(IMAGES_BIN,
-                          read_pts2d=(args.highlight_mode == "colmap"))
+entries = read_images_bin(IMAGES_BIN, read_pts2d=True)
 print(f"  {len(entries)} registered frames")
 
-cameras: dict = {}
-if CAMERAS_BIN.exists():
-    cameras = read_cameras_bin(CAMERAS_BIN)
-    print(f"  {len(cameras)} camera model(s) loaded from cameras.bin")
-
-# colmap mode: pre-compute per-frame sparse point arrays from points3D.bin
+# pre-compute per-frame sparse point arrays from points3D.bin
 name_to_sparse_pts: dict[str, tuple[np.ndarray, np.ndarray]] = {}
-if args.highlight_mode == "colmap":
-    if not POINTS3D_BIN.exists():
-        print(f"  [warn] points3D.bin not found — colmap highlight unavailable")
-    else:
-        print("Loading points3D.bin for colmap highlight mode ...")
-        points3d = read_points3d_bin(POINTS3D_BIN)
-        for entry in entries:
-            ids = entry.get("point3d_ids") or []
-            valid = [points3d[pid] for pid in ids if pid in points3d]
-            if valid:
-                name_to_sparse_pts[entry["name"]] = (
-                    np.array([v[0] for v in valid], dtype=np.float64),
-                    np.array([v[1] for v in valid], dtype=np.uint8),
-                )
-        print(f"  {len(name_to_sparse_pts)} frames have sparse point observations")
+if not POINTS3D_BIN.exists():
+    print(f"  [warn] points3D.bin not found — point-cloud highlight unavailable")
+else:
+    print("Loading points3D.bin ...")
+    points3d = read_points3d_bin(POINTS3D_BIN)
+    for entry in entries:
+        ids = entry.get("point3d_ids") or []
+        valid_pids = [pid for pid in ids
+                      if pid in points3d
+                      and points3d[pid][2] < 1.0    # reprojection error < 1px
+                      and points3d[pid][3] >= 3]     # observed by >= 3 cameras
+        if valid_pids:
+            valid = [points3d[pid] for pid in valid_pids]
+            name_to_sparse_pts[entry["name"]] = (
+                np.array([v[0] for v in valid], dtype=np.float64),
+                np.array([v[1] for v in valid], dtype=np.uint8),
+                np.array(valid_pids, dtype=np.int64),
+            )
+    print(f"  {len(name_to_sparse_pts)} frames have sparse point observations")
 
 print("Loading room labels ...")
 room_labels = np.load(LABELS_NPY)   # shape (N,), one label per keyframe in sequence order
@@ -308,6 +246,11 @@ with server.gui.add_folder("Selected frame"):
     gui_frame_label = server.gui.add_html("<i>Click a frustum in the 3D view</i>")
     gui_image       = server.gui.add_image(
         np.zeros((270, 480, 3), dtype=np.uint8), label=None, format="jpeg")
+    gui_reset_btn   = server.gui.add_button("Reset view")
+
+@gui_reset_btn.on_click
+def _on_reset(_):
+    _reset_points()
 
 # Segment legend
 with server.gui.add_folder("Segments"):
@@ -325,50 +268,193 @@ with server.gui.add_folder("Segments"):
 # ---------------------------------------------------------------------------
 print("Adding camera frustums ...")
 
-# name → overlay frustum handle (white highlight frustum on top of original)
-selected_handles: dict[str, object] = {}
-# name → point mask (zbuffer) or (pts, clrs) tuple (colmap) for selected frames
-selected_pts: dict[str, object] = {}
-# double-click detection: name, time, and state-before-first-click
-_last_click: dict = {"name": "", "time": 0.0, "was_selected": False}
-# frame name → (qvec, tvec, cam_id, wxyz, pos) for segment-level selection
-name_to_props: dict[str, dict] = {}
+# double-click detection
+_last_click: dict = {"name": "", "time": 0.0}
 # segment_id → list of frame names that have frustums
 seg_to_names: dict[int, list[str]] = {}
+# handle for the selection sphere indicator
+_sphere_handle = {"h": None}
+# handle for the segment centroid marker (double-click)
+_centroid_handle = {"h": None}
 
-def _compute_and_store_pts(name, qvec, tvec, cam_id):
-    """Compute visible point data for one frame and store in selected_pts."""
-    if args.highlight_mode == "colmap":
-        if name in name_to_sparse_pts:
-            selected_pts[name] = name_to_sparse_pts[name]
-    elif pcd_loaded and cam_id in cameras:
-        cam = cameras[cam_id]
-        selected_pts[name] = visible_point_mask(
-            pts_all, qvec, tvec,
-            cam["width"], cam["height"],
-            cam["fx"], cam["fy"], cam["cx"], cam["cy"])
+# --double_click_mode sparse: points within this radius are considered
+# spatially connected when finding the largest "near" cluster.
+_CLUSTER_RADIUS = 0.15
 
-def refresh_highlight():
-    """Recompute and update point_cloud/hi from all currently selected frames."""
-    if not selected_pts:
-        server.scene.add_point_cloud(
-            name="point_cloud/hi",
-            points=np.zeros((0, 3), dtype=np.float64),
-            colors=np.zeros((0, 3), dtype=np.uint8),
-            point_size=0.014)
+def _largest_cluster_mask(pts: np.ndarray, radius: float) -> np.ndarray:
+    """Boolean mask selecting the largest spatially-connected component of pts.
+
+    Points are grouped into a voxel grid (cell size = radius); two points
+    are considered connected if their voxels are the same or 26-adjacent.
+    Connected components are computed on the (much smaller) voxel graph and
+    mapped back to points. The mask marks the largest component (the "near"
+    cluster).
+    """
+    n = len(pts)
+    if n == 0:
+        return np.zeros(0, dtype=bool)
+
+    vox = np.floor(pts / radius).astype(np.int32)
+    uniq_vox, point_vox = np.unique(vox, axis=0, return_inverse=True)
+    n_vox = len(uniq_vox)
+
+    packed        = _pack_vox(uniq_vox)
+    order         = np.argsort(packed)
+    sorted_packed = packed[order]
+
+    offsets = np.array([[dx, dy, dz]
+                         for dx in (-1, 0, 1)
+                         for dy in (-1, 0, 1)
+                         for dz in (-1, 0, 1)
+                         if (dx, dy, dz) != (0, 0, 0)], dtype=np.int32)
+
+    edges_a, edges_b = [], []
+    for off in offsets:
+        neighbor_packed = _pack_vox(uniq_vox + off)
+        pos   = np.searchsorted(sorted_packed, neighbor_packed)
+        valid = (pos < n_vox) & (sorted_packed[np.minimum(pos, n_vox - 1)] == neighbor_packed)
+        edges_a.append(np.arange(n_vox)[valid])
+        edges_b.append(order[pos[valid]])
+
+    graph = coo_matrix((np.ones(sum(len(a) for a in edges_a), dtype=np.int8),
+                         (np.concatenate(edges_a), np.concatenate(edges_b))),
+                        shape=(n_vox, n_vox))
+    _, vox_labels = connected_components(graph, directed=False)
+    largest = np.bincount(vox_labels).argmax()
+    return vox_labels[point_vox] == largest
+
+# double-click results accumulate here, keyed by segment_id, until reset
+_accumulated_segments: dict[int, tuple[np.ndarray, np.ndarray]] = {}
+
+DENSITY_OUT_DIR = SEG_DIR / "xz_density"
+DENSITY_OUT_DIR.mkdir(parents=True, exist_ok=True)
+
+def _save_xz_density(pts: np.ndarray, segment_id: int, bin_size: float = 0.05):
+    """Save a 2D density histogram of pts projected onto the XZ plane."""
+    if len(pts) == 0:
         return
-    if args.highlight_mode == "colmap":
-        all_pts  = np.concatenate([v[0] for v in selected_pts.values()], axis=0)
-        all_clrs = np.concatenate([v[1] for v in selected_pts.values()], axis=0)
-        server.scene.add_point_cloud(
-            name="point_cloud/hi", points=all_pts, colors=all_clrs, point_size=0.02)
+    x, z = pts[:, 0], pts[:, 2]
+    x_bins = int(np.ceil((x.max() - x.min()) / bin_size)) + 1
+    z_bins = int(np.ceil((z.max() - z.min()) / bin_size)) + 1
+    x_bins = max(x_bins, 1)
+    z_bins = max(z_bins, 1)
+
+    hist, x_edges, z_edges = np.histogram2d(x, z, bins=[x_bins, z_bins])
+
+    com_x, com_z = float(x.mean()), float(z.mean())
+
+    # Save raw numpy
+    npy_path = DENSITY_OUT_DIR / f"seg_{segment_id}_xz_density.npy"
+    np.save(npy_path, hist)
+
+    com_path = DENSITY_OUT_DIR / f"seg_{segment_id}_com.json"
+    with open(com_path, "w") as fp:
+        json.dump({"center_of_mass_x": com_x, "center_of_mass_z": com_z,
+                    "n_points": len(pts)}, fp, indent=2)
+
+    # Save visualization
+    fig, ax = plt.subplots(figsize=(8, 8))
+    im = ax.imshow(hist.T, origin="lower", aspect="equal",
+                   extent=[x_edges[0], x_edges[-1], z_edges[0], z_edges[-1]],
+                   cmap="hot", interpolation="nearest")
+    ax.plot(com_x, com_z, marker="+", color="cyan", markersize=14, markeredgewidth=2)
+    ax.set_xlabel("X")
+    ax.set_ylabel("Z")
+    ax.set_title(f"Segment {segment_id} — XZ density (bin={bin_size}m)")
+    fig.colorbar(im, ax=ax, label="Point count")
+    png_path = DENSITY_OUT_DIR / f"seg_{segment_id}_xz_density.png"
+    fig.savefig(png_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  XZ density saved: {npy_path.name}, {png_path.name}, CoM=({com_x:.3f}, {com_z:.3f})")
+
+def _show_points_for_frames(frame_names: list[str], is_segment: bool = False,
+                             segment_id: int | None = None):
+    """Display 3D points for the given frame(s).
+
+    is_segment=False (single-click): show one frame's sparse points directly.
+    is_segment=True  (double-click): show the whole segment's points.
+      - First filters to points observed by >=2 frames (multi-view filter).
+      - Then depending on --double_click_mode:
+          dense:  find nearby dense PLY points via voxel-grid lookup.
+          sparse: keep only the largest spatial cluster (drop outliers).
+      - Results accumulate across double-clicks until reset.
+    """
+    if not frame_names:
+        return
+    valid_names = [n for n in frame_names if n in name_to_sparse_pts]
+    if not valid_names:
+        return
+
+    all_pts  = np.concatenate([name_to_sparse_pts[n][0] for n in valid_names])
+    all_clrs = np.concatenate([name_to_sparse_pts[n][1] for n in valid_names])
+
+    if is_segment:
+        # Multi-view filter: keep only points seen by >= 2 frames in this segment
+        all_pids = np.concatenate([name_to_sparse_pts[n][2] for n in valid_names])
+        uniq_pids, first_idx, counts = np.unique(all_pids, return_index=True, return_counts=True)
+        multi = counts >= 3
+        all_pts  = all_pts[first_idx[multi]]
+        all_clrs = all_clrs[first_idx[multi]]
+        print(f"  multi-view filter: {multi.sum()}/{len(uniq_pids)} unique pts seen by >=3 frames")
+
+    if is_segment and args.double_click_mode == "dense" \
+            and pcd_loaded and _vox_sorted_packed is not None:
+        # Dense mode: find dense PLY points near the filtered sparse points
+        dense_idx  = _dense_near_sparse(all_pts)
+        print(f"  dense: {len(all_pts)} sparse → {len(dense_idx)} dense pts")
+        shown_pts  = pts_all[dense_idx]
+        shown_clrs = clrs_all[dense_idx]
+        point_size = 0.008
     else:
-        cum_mask = np.zeros(len(pts_all), dtype=bool)
-        for mask in selected_pts.values():
-            cum_mask |= mask
+        shown_pts  = all_pts
+        shown_clrs = all_clrs
+
+        if is_segment and args.double_click_mode == "sparse":
+            # Sparse mode: keep only the largest spatial cluster
+            mask = _largest_cluster_mask(shown_pts, _CLUSTER_RADIUS)
+            print(f"  sparse cluster: {mask.sum()}/{len(mask)} pts in largest cluster")
+            shown_pts  = shown_pts[mask]
+            shown_clrs = shown_clrs[mask]
+
+        point_size = 0.02
+
+    if is_segment and segment_id is not None:
+        # Accumulate across double-clicks
+        _accumulated_segments[segment_id] = (shown_pts, shown_clrs)
+        display_pts  = np.concatenate([p for p, _ in _accumulated_segments.values()], axis=0)
+        display_clrs = np.concatenate([c for _, c in _accumulated_segments.values()], axis=0)
+        print(f"  accumulated: {len(_accumulated_segments)} segment(s), "
+              f"{len(display_pts)} pts total")
+    else:
+        display_pts, display_clrs = shown_pts, shown_clrs
+
+    server.scene.add_point_cloud(
+        name="point_cloud",
+        points=display_pts,
+        colors=display_clrs,
+        point_size=point_size)
+
+    if is_segment and len(shown_pts) > 0:
+        # Show centroid marker for the current segment's points
+        centroid = shown_pts.mean(axis=0)
+        if _centroid_handle["h"] is not None:
+            _centroid_handle["h"].remove()
+        _centroid_handle["h"] = server.scene.add_icosphere(
+            name="/centroid", radius=0.15,
+            color=(0, 200, 255), position=tuple(centroid))
+        _save_xz_density(shown_pts, segment_id)
+
+def _reset_points():
+    _accumulated_segments.clear()
+    if pcd_loaded:
         server.scene.add_point_cloud(
-            name="point_cloud/hi",
-            points=pts_all[cum_mask], colors=clrs_all[cum_mask], point_size=0.014)
+            name="point_cloud", points=_display_pts, colors=_display_clrs, point_size=0.008)
+    if _sphere_handle["h"] is not None:
+        _sphere_handle["h"].remove()
+        _sphere_handle["h"] = None
+    if _centroid_handle["h"] is not None:
+        _centroid_handle["h"].remove()
+        _centroid_handle["h"] = None
 
 for i, entry in enumerate(entries):
     sid = name_to_seg.get(entry["name"], -1)
@@ -386,9 +472,6 @@ for i, entry in enumerate(entries):
     # Invert by conjugating the quaternion: (qw, -qx, -qy, -qz).
     frustum_wxyz = (qw, -qx, -qy, -qz)
     frustum_pos  = tuple(center)
-    name_to_props[entry["name"]] = dict(
-        qvec=entry["qvec"], tvec=entry["tvec"], cam_id=entry["cam_id"],
-        wxyz=frustum_wxyz, pos=frustum_pos)
     seg_to_names.setdefault(sid, []).append(entry["name"])
     handle = server.scene.add_camera_frustum(
         name     = f"/cameras/{entry['name']}",
@@ -400,8 +483,7 @@ for i, entry in enumerate(entries):
         position = frustum_pos,
     )
 
-    def make_click_handler(name, path, segment_id, label_idx, qvec, tvec, cam_id,
-                           wxyz, pos):
+    def make_click_handler(name, path, segment_id, label_idx, pos):
         def on_click(_):
             color_hex = rgb_to_hex(SEG_PALETTE[segment_id])
             gui_frame_label.content = (
@@ -413,67 +495,36 @@ for i, entry in enumerate(entries):
             gui_image.image = load_image_array(path)
 
             now = time.time()
-            is_double = (_last_click["name"] == name and
-                         now - _last_click["time"] < 0.5)
-            # Record state BEFORE this click only on first click, so that the
-            # double-click handler knows the original pre-first-click state.
-            if not is_double:
-                _last_click["was_selected"] = (name in selected_handles)
+            time_diff = now - _last_click["time"]
+            is_double = (_last_click["name"] == name and time_diff < 0.8)
+            print(f"  click {name}: diff={time_diff:.3f}s, is_double={is_double}")
             _last_click["name"] = name
             _last_click["time"] = now
 
-            def _add_selected(n, p_qvec, p_tvec, p_cam_id, p_pos):
-                h = server.scene.add_icosphere(
-                    name=f"/selected/{n}",
-                    radius=0.05, color=(255, 220, 0),
-                    position=p_pos)
-                selected_handles[n] = h
-                _compute_and_store_pts(n, p_qvec, p_tvec, p_cam_id)
-
-            def _remove_selected(n):
-                selected_handles.pop(n).remove()
-                selected_pts.pop(n, None)
-
             if is_double:
-                # Undo the first-click single-toggle before applying segment toggle
-                if _last_click["was_selected"]:
-                    # First click deselected name → re-add it
-                    if name not in selected_handles and name in name_to_props:
-                        p = name_to_props[name]
-                        _add_selected(name, p["qvec"], p["tvec"],
-                                      p["cam_id"], p["pos"])
-                else:
-                    # First click selected name → remove it
-                    if name in selected_handles:
-                        _remove_selected(name)
-
-                # Now toggle entire segment based on restored state
-                seg_names = seg_to_names.get(segment_id, [])
-                all_selected = all(n in selected_handles for n in seg_names)
-                for n in seg_names:
-                    if all_selected:
-                        if n in selected_handles:
-                            _remove_selected(n)
-                    else:
-                        if n not in selected_handles and n in name_to_props:
-                            p = name_to_props[n]
-                            _add_selected(n, p["qvec"], p["tvec"],
-                                          p["cam_id"], p["pos"])
+                # Double-click: show all points for this segment
+                if _sphere_handle["h"] is not None:
+                    _sphere_handle["h"].remove()
+                    _sphere_handle["h"] = None
+                _show_points_for_frames(seg_to_names.get(segment_id, []),
+                                        is_segment=True, segment_id=segment_id)
             else:
-                # Single click: toggle this frustum
-                if name in selected_handles:
-                    _remove_selected(name)
-                else:
-                    _add_selected(name, qvec, tvec, cam_id, pos)
-
-            refresh_highlight()
+                # Single click: show points for this frustum only
+                if _sphere_handle["h"] is not None:
+                    _sphere_handle["h"].remove()
+                if _centroid_handle["h"] is not None:
+                    _centroid_handle["h"].remove()
+                    _centroid_handle["h"] = None
+                _sphere_handle["h"] = server.scene.add_icosphere(
+                    name="/selected", radius=0.05,
+                    color=(255, 220, 0), position=pos)
+                _show_points_for_frames([name])
         return on_click
 
     handle.on_click(make_click_handler(
         entry["name"], KF_DIR / entry["name"], sid,
         name_to_label.get(entry["name"], -1),
-        entry["qvec"], entry["tvec"], entry["cam_id"],
-        frustum_wxyz, frustum_pos))
+        frustum_pos))
 
 print(f"Added {len(entries) // args.every_n} frustums.")
 
@@ -484,6 +535,36 @@ print(f"Added {len(entries) // args.every_n} frustums.")
 pts_all:  np.ndarray | None = None
 clrs_all: np.ndarray | None = None
 pcd_loaded = False
+_VOXEL_SIZE = 0.15
+_vox_sorted_packed: np.ndarray | None = None  # sorted int64 voxel keys for all dense pts
+_vox_sort_order:    np.ndarray | None = None  # argsort that produced _vox_sorted_packed
+
+def _pack_vox(vox: np.ndarray) -> np.ndarray:
+    """Pack (K, 3) int32 voxel indices into (K,) int64 keys (collision-free for ±8192/axis)."""
+    OFFSET = 1 << 13
+    x = (vox[:, 0].astype(np.int64) + OFFSET) & 0x3FFF
+    y = (vox[:, 1].astype(np.int64) + OFFSET) & 0x3FFF
+    z = (vox[:, 2].astype(np.int64) + OFFSET) & 0x3FFF
+    return x | (y << 14) | (z << 28)
+
+def _dense_near_sparse(sparse_pts: np.ndarray) -> np.ndarray:
+    """Return indices into pts_all for dense points within one voxel of any sparse point."""
+    if _vox_sorted_packed is None:
+        return np.array([], dtype=np.int64)
+    sp_vox = np.floor(sparse_pts / _VOXEL_SIZE).astype(np.int32)       # (K, 3)
+    offsets = np.array([[dx, dy, dz]
+                        for dx in (-1, 0, 1)
+                        for dy in (-1, 0, 1)
+                        for dz in (-1, 0, 1)], dtype=np.int32)          # (27, 3)
+    query_vox  = (sp_vox[:, None] + offsets[None]).reshape(-1, 3)       # (K*27, 3)
+    query_keys = np.unique(_pack_vox(query_vox))                         # sorted unique keys
+    lo = np.searchsorted(_vox_sorted_packed, query_keys)
+    hi = np.searchsorted(_vox_sorted_packed, query_keys, side="right")
+    hit = hi > lo
+    pieces = [_vox_sort_order[lo[i]:hi[i]] for i in np.where(hit)[0]]
+    if not pieces:
+        return np.array([], dtype=np.int64)
+    return np.unique(np.concatenate(pieces))
 
 ply_path = SCENE_DIR / f"{args.scene_id}_metric.ply"
 if ply_path.exists():
@@ -493,22 +574,26 @@ if ply_path.exists():
         pts  = np.asarray(pcd.points, dtype=np.float64)   # (N, 3) world coords
         clrs = (np.asarray(pcd.colors) * 255).astype(np.uint8) if pcd.has_colors() \
                else np.full((len(pts), 3), 180, dtype=np.uint8)  # (N, 3) RGB 0-255
-        if args.highlight_mode == "zbuffer" and len(pts) > 3_000_000:
-            idx  = np.random.choice(len(pts), 3_000_000, replace=False)
-            pts, clrs = pts[idx], clrs[idx]
         pts_all   = pts
         clrs_all  = clrs
         pcd_loaded = True
-        # Background layer: dimmed to 30% so highlighted points stand out
-        clrs_dim = (clrs * 0.20).astype(np.uint8)
+        vox_idx = np.floor(pts_all / _VOXEL_SIZE).astype(np.int32)
+        order   = np.argsort(_pack_vox(vox_idx), kind="stable")
+        _vox_sort_order    = order
+        _vox_sorted_packed = _pack_vox(vox_idx)[order]
+        print(f"  Voxel grid built on {len(pts_all)} points")
+        # Subsample for display if exceeding cap
+        if args.max_display_pts > 0 and len(pts_all) > args.max_display_pts:
+            rng = np.random.default_rng(42)
+            _disp_idx = np.sort(rng.choice(len(pts_all), size=args.max_display_pts, replace=False))
+            _display_pts  = pts_all[_disp_idx]
+            _display_clrs = clrs_all[_disp_idx]
+            print(f"  Display cap: {len(pts_all)} → {args.max_display_pts} pts")
+        else:
+            _display_pts  = pts_all
+            _display_clrs = clrs_all
         server.scene.add_point_cloud(
-            name="point_cloud/bg", points=pts, colors=clrs_dim, point_size=0.008)
-        # Highlight layer: starts empty, updated on each frustum click
-        server.scene.add_point_cloud(
-            name="point_cloud/hi",
-            points=np.zeros((0, 3), dtype=np.float64),
-            colors=np.zeros((0, 3), dtype=np.uint8),
-            point_size=0.014)
+            name="point_cloud", points=_display_pts, colors=_display_clrs, point_size=0.008)
         print(f"Loaded point cloud: {ply_path.name} ({len(pts)} pts)")
     except Exception as e:
         print(f"Could not load point cloud: {e}")
@@ -518,7 +603,6 @@ if ply_path.exists():
 # ---------------------------------------------------------------------------
 print("\nViewer ready. Press Ctrl+C to stop.\n")
 try:
-    import time
     while True:
         time.sleep(1)
 except KeyboardInterrupt:

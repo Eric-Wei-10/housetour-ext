@@ -17,6 +17,7 @@ Usage:
 
 import argparse
 import json
+import random
 import re
 from pathlib import Path
 
@@ -47,10 +48,19 @@ PROMPT_BED_COUNT = (
     "Answer with exactly one word: none, one, or multiple."
 )
 
+N_NONE_GAP_VOTES = 5  # VLM queries per none-gap check
+
 PROMPT_MULTI_BED_ROOM = (
     "This image shows multiple beds.\n"
     "Are all the beds in this image in the SAME room, "
     "or do they appear to be in DIFFERENT rooms (e.g. seen through a doorway)?\n"
+    "Answer with exactly one word: same or different."
+)
+
+PROMPT_SAME_BED = (
+    "You are given two images from a bedroom house-tour video.\n"
+    "Each bedroom contains exactly one unique adult bed.\n"
+    "Is the bed shown in image 1 the SAME bed as the one shown in image 2?\n"
     "Answer with exactly one word: same or different."
 )
 
@@ -229,6 +239,80 @@ def print_frame_table(frames: list[dict],
 
 
 # ---------------------------------------------------------------------------
+# None-gap analysis
+# ---------------------------------------------------------------------------
+def check_none_gaps(
+    frames: list[dict],
+    bed_labels: list[str],
+    kf_dir: Path,
+    model, processor, device: str,
+    n_votes: int = N_NONE_GAP_VOTES,
+    depth: int = 0,
+) -> list[dict]:
+    """Check none-gaps between one-regions for potential room transitions.
+
+    After split_recursive, remaining 'multiple' labels are same-room, so treat
+    them as 'one'. For each consecutive run of 'none' with 'one' frames on both
+    sides, randomly sample one frame from each side and ask the VLM n_votes times
+    whether the two beds are the same. 'different' strictly outvoting 'same'
+    indicates an under-segmented transition.
+
+    Returns a list of gap result dicts (one per none-run that was checked).
+    """
+    indent = "    " + "  " * depth
+
+    # Treat remaining 'multiple' as 'one' (they are same-room by this point)
+    labels = ["one" if lb == "multiple" else lb for lb in bed_labels]
+    n = len(labels)
+
+    gap_results = []
+    i = 0
+    while i < n:
+        if labels[i] != "none":
+            i += 1
+            continue
+
+        none_start = i
+        while i < n and labels[i] == "none":
+            i += 1
+        none_end = i - 1
+
+        before_idxs = [j for j in range(0, none_start)    if labels[j] == "one"]
+        after_idxs  = [j for j in range(none_end + 1, n)  if labels[j] == "one"]
+
+        if not before_idxs or not after_idxs:
+            print(f"{indent}none gap [{none_start}–{none_end}]: "
+                  f"no one-frames on {'both sides' if not before_idxs and not after_idxs else 'one side'}, skip")
+            continue
+
+        n_same = n_diff = 0
+        for _ in range(n_votes):
+            b_path = kf_dir / frames[random.choice(before_idxs)]["frame"]
+            a_path = kf_dir / frames[random.choice(after_idxs)]["frame"]
+            answer = run_vlm([b_path, a_path], PROMPT_SAME_BED, model, processor, device)
+            if "same" in answer:
+                n_same += 1
+            else:
+                n_diff += 1
+
+        do_split = n_diff > n_same
+        verdict  = "DIFFERENT → split" if do_split else "same → no split"
+        print(f"{indent}none gap [{none_start}–{none_end}]: "
+              f"same={n_same} diff={n_diff} → {verdict}")
+
+        gap_results.append({
+            "none_range":  [none_start, none_end],
+            "before_n":    len(before_idxs),
+            "after_n":     len(after_idxs),
+            "same_votes":  n_same,
+            "diff_votes":  n_diff,
+            "do_split":    do_split,
+        })
+
+    return gap_results
+
+
+# ---------------------------------------------------------------------------
 # Per-scene
 # ---------------------------------------------------------------------------
 def probe_scene(scene_id: str, model, processor, device: str,
@@ -272,18 +356,30 @@ def probe_scene(scene_id: str, model, processor, device: str,
 
         print_frame_table(frames, bed_labels_raw, bed_labels_smoothed)
 
-        # Recursive transition analysis
+        # Recursive transition analysis (multiple-bed runs)
         print(f"\n  --- transition analysis ---")
         sub_segs = split_recursive(frames, bed_labels_smoothed)
         print(f"  → {len(sub_segs)} sub-segment(s):")
         for k, (ss_frames, _) in enumerate(sub_segs):
             print(f"     [{k}] {ss_frames[0]['frame']} … {ss_frames[-1]['frame']}  ({len(ss_frames)} frames)")
 
+        # None-gap analysis: for each sub-segment, check none-gaps between one-regions
+        print(f"\n  --- none-gap analysis ---")
+        all_gap_results = []
+        for k, (ss_frames, ss_labels) in enumerate(sub_segs):
+            print(f"  sub-seg [{k}] ({len(ss_frames)} frames):")
+            gaps = check_none_gaps(ss_frames, ss_labels, kf_dir, model, processor, device)
+            all_gap_results.append(gaps)
+
         seg_result: dict = {"segment_id": sid, "frames": frames}
         if not dry_run:
             seg_result["sub_segments"] = [
-                {"frames": [f["frame"] for f in ss_frames], "n_frames": len(ss_frames)}
-                for ss_frames, _ in sub_segs
+                {
+                    "frames":    [f["frame"] for f in ss_frames],
+                    "n_frames":  len(ss_frames),
+                    "none_gaps": gaps,
+                }
+                for (ss_frames, _), gaps in zip(sub_segs, all_gap_results)
             ]
         scene_results.append(seg_result)
 

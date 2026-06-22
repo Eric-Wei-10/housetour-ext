@@ -36,8 +36,8 @@ _TEMPLATES = [
 
 def load_siglip_model(device: str):
     print(f"Loading {SIGLIP_MODEL_NAME} from transformers ...")
-    processor = AutoProcessor.from_pretrained(SIGLIP_MODEL_NAME, cache_dir=SIGLIP_CACHE_DIR, token=HF_TOKEN, local_files_only=True)
-    model = AutoModel.from_pretrained(SIGLIP_MODEL_NAME, cache_dir=SIGLIP_CACHE_DIR, token=HF_TOKEN, local_files_only=True)
+    processor = AutoProcessor.from_pretrained(SIGLIP_MODEL_NAME, cache_dir=SIGLIP_CACHE_DIR, token=HF_TOKEN)
+    model = AutoModel.from_pretrained(SIGLIP_MODEL_NAME, cache_dir=SIGLIP_CACHE_DIR, token=HF_TOKEN)
     model.eval().to(device)
     return model, processor
 
