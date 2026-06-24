@@ -329,6 +329,115 @@ _accumulated_segments: dict[int, tuple[np.ndarray, np.ndarray]] = {}
 DENSITY_OUT_DIR = SEG_DIR / "xz_density"
 DENSITY_OUT_DIR.mkdir(parents=True, exist_ok=True)
 
+
+def _find_min_bbox_95(hist: np.ndarray, x_edges: np.ndarray, z_edges: np.ndarray,
+                       com_xz: np.ndarray, n_angles: int = 36,
+                       coverage: float = 0.95) -> tuple[np.ndarray, float] | None:
+    """Minimum-area oriented bbox covering *coverage* of the density, containing com_xz.
+
+    Each non-zero histogram bin becomes a weighted 2D point (weight = bin count).
+    For each of *n_angles* orientations in [0, pi), the algorithm rotates into an
+    axis-aligned frame and runs a two-level sliding-window search:
+      1. Outer: sweep left boundary along the primary axis (u), for each left
+         boundary enumerate right boundaries from the tightest valid one outward.
+      2. Inner: for the bins inside the u-range, sort by secondary axis (v) and
+         use vectorised searchsorted to find the narrowest v-interval whose
+         cumulative weight >= target and that contains the (rotated) CoM.
+    The combination with smallest area wins.
+
+    Returns (corners (4,2) in original XZ coords, area), or None.
+    """
+    nz_rows, nz_cols = np.nonzero(hist)
+    if len(nz_rows) < 4:
+        return None
+    x_c = 0.5 * (x_edges[nz_rows] + x_edges[nz_rows + 1])
+    z_c = 0.5 * (z_edges[nz_cols] + z_edges[nz_cols + 1])
+    w = hist[nz_rows, nz_cols].astype(np.float64)
+    pts = np.column_stack([x_c, z_c])
+
+    total_w = w.sum()
+    target_w = coverage * total_w
+    M = len(pts)
+
+    best_area = np.inf
+    best_info = None
+
+    for k in range(n_angles):
+        theta = np.pi * k / n_angles
+        ct, st = np.cos(theta), np.sin(theta)
+        R = np.array([[ct, st], [-st, ct]])
+        rot = pts @ R.T
+        com_r = com_xz @ R.T
+        cu, cv = float(com_r[0]), float(com_r[1])
+
+        u_order = np.argsort(rot[:, 0])
+        u_s = rot[u_order, 0]
+        v_s = rot[u_order, 1]
+        w_s = w[u_order]
+        cum_w = np.cumsum(w_s)
+
+        step_l = max(1, M // 30)
+        for l in range(0, M, step_l):
+            if u_s[l] > cu:
+                break
+            w_before = cum_w[l - 1] if l > 0 else 0.0
+            if cum_w[-1] - w_before < target_w:
+                break
+
+            r_min_w = int(np.searchsorted(cum_w, target_w + w_before, side="left"))
+            r_min_w = max(r_min_w, l)
+            r_min_cu = int(np.searchsorted(u_s, cu, side="left"))
+            r_start = max(r_min_w, r_min_cu)
+            if r_start >= M:
+                continue
+
+            step_r = max(1, (M - r_start) // 20)
+            for r in range(r_start, M, step_r):
+                u_lo, u_hi = u_s[l], u_s[r]
+                u_width = u_hi - u_lo
+
+                v_win = v_s[l:r + 1]
+                w_win = w_s[l:r + 1]
+                v_ord = np.argsort(v_win)
+                v_sorted = v_win[v_ord]
+                w_sorted = w_win[v_ord]
+                cum_w_v = np.cumsum(w_sorted)
+                n_v = len(v_sorted)
+
+                prev_cum = np.empty(n_v)
+                prev_cum[0] = 0.0
+                prev_cum[1:] = cum_w_v[:-1]
+                e_min = np.searchsorted(cum_w_v, target_w + prev_cum, side="left")
+
+                s_arr = np.arange(n_v)
+                valid_e = e_min < n_v
+                valid_s_cv = v_sorted <= cv
+                e_clamped = np.minimum(e_min, n_v - 1)
+                valid_e_cv = v_sorted[e_clamped] >= cv
+                valid = valid_e & valid_s_cv & valid_e_cv
+
+                if not valid.any():
+                    continue
+                v_ranges = v_sorted[e_min[valid]] - v_sorted[s_arr[valid]]
+                bi = v_ranges.argmin()
+                area = u_width * v_ranges[bi]
+                if area < best_area:
+                    best_area = area
+                    s_best = int(s_arr[valid][bi])
+                    e_best = int(e_min[valid][bi])
+                    best_info = (theta, float(u_lo), float(u_hi),
+                                 float(v_sorted[s_best]), float(v_sorted[e_best]))
+
+    if best_info is None:
+        return None
+    theta, u_lo, u_hi, v_lo, v_hi = best_info
+    ct, st = np.cos(theta), np.sin(theta)
+    R_inv = np.array([[ct, -st], [st, ct]])
+    corners_rot = np.array([[u_lo, v_lo], [u_hi, v_lo],
+                             [u_hi, v_hi], [u_lo, v_hi]])
+    return corners_rot @ R_inv.T, best_area
+
+
 def _save_xz_density(pts: np.ndarray, segment_id: int, bin_size: float = 0.05):
     """Save a 2D density histogram of pts projected onto the XZ plane."""
     if len(pts) == 0:
@@ -342,15 +451,26 @@ def _save_xz_density(pts: np.ndarray, segment_id: int, bin_size: float = 0.05):
     hist, x_edges, z_edges = np.histogram2d(x, z, bins=[x_bins, z_bins])
 
     com_x, com_z = float(x.mean()), float(z.mean())
+    com_xz = np.array([com_x, com_z])
 
-    # Save raw numpy
-    npy_path = DENSITY_OUT_DIR / f"seg_{segment_id}_xz_density.npy"
-    np.save(npy_path, hist)
+    # Save histogram + edges (for offline bbox computation)
+    npz_path = DENSITY_OUT_DIR / f"seg_{segment_id}_xz_density.npz"
+    np.savez(npz_path, hist=hist, x_edges=x_edges, z_edges=z_edges)
 
-    com_path = DENSITY_OUT_DIR / f"seg_{segment_id}_com.json"
-    with open(com_path, "w") as fp:
-        json.dump({"center_of_mass_x": com_x, "center_of_mass_z": com_z,
-                    "n_points": len(pts)}, fp, indent=2)
+    # Compute 95% oriented bounding box
+    bbox_result = _find_min_bbox_95(hist, x_edges, z_edges, com_xz)
+
+    meta = {"center_of_mass_x": com_x, "center_of_mass_z": com_z,
+            "n_points": len(pts)}
+    if bbox_result is not None:
+        corners, area = bbox_result
+        meta["bbox_corners"] = corners.tolist()
+        meta["bbox_area"] = float(area)
+        print(f"  bbox: area={area:.3f} m², corners={corners.round(2).tolist()}")
+
+    json_path = DENSITY_OUT_DIR / f"seg_{segment_id}_com.json"
+    with open(json_path, "w") as fp:
+        json.dump(meta, fp, indent=2)
 
     # Save visualization
     fig, ax = plt.subplots(figsize=(8, 8))
@@ -358,6 +478,9 @@ def _save_xz_density(pts: np.ndarray, segment_id: int, bin_size: float = 0.05):
                    extent=[x_edges[0], x_edges[-1], z_edges[0], z_edges[-1]],
                    cmap="hot", interpolation="nearest")
     ax.plot(com_x, com_z, marker="+", color="cyan", markersize=14, markeredgewidth=2)
+    if bbox_result is not None:
+        closed = np.vstack([corners, corners[0]])
+        ax.plot(closed[:, 0], closed[:, 1], "-", color="cyan", linewidth=2)
     ax.set_xlabel("X")
     ax.set_ylabel("Z")
     ax.set_title(f"Segment {segment_id} — XZ density (bin={bin_size}m)")
@@ -365,7 +488,7 @@ def _save_xz_density(pts: np.ndarray, segment_id: int, bin_size: float = 0.05):
     png_path = DENSITY_OUT_DIR / f"seg_{segment_id}_xz_density.png"
     fig.savefig(png_path, dpi=150, bbox_inches="tight")
     plt.close(fig)
-    print(f"  XZ density saved: {npy_path.name}, {png_path.name}, CoM=({com_x:.3f}, {com_z:.3f})")
+    print(f"  XZ density saved: {npz_path.name}, {png_path.name}, CoM=({com_x:.3f}, {com_z:.3f})")
 
 def _show_points_for_frames(frame_names: list[str], is_segment: bool = False,
                              segment_id: int | None = None):
