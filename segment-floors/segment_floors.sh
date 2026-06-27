@@ -9,11 +9,11 @@
 #SBATCH --gpus=1
 
 # Usage:
-#   Single scene  : sbatch segment_floors.sbatch 14
-#   Several scenes: sbatch segment_floors.sbatch 11 14 1002
-#   Range         : sbatch segment_floors.sbatch 100-200
-#   Mixed         : sbatch segment_floors.sbatch 11 100-200 1624
-#   With options  : sbatch segment_floors.sbatch 11 14 --model vitl14 --skip 5 --bin_size 0.1
+#   Single scene  : sbatch segment-floors/segment_floors.sbatch 14
+#   Several scenes: sbatch segment-floors/segment_floors.sbatch 11 14 1002
+#   Range         : sbatch segment-floors/segment_floors.sbatch 100-200
+#   Mixed         : sbatch segment-floors/segment_floors.sbatch 11 100-200 1624
+#   With options  : sbatch segment-floors/segment_floors.sbatch 11 14 --model vitl14 --skip 5 --bin_size 0.1
 
 module load stack/2024-06
 module load cuda/12.4
@@ -103,6 +103,12 @@ run_scene() {
     if [ $? -ne 0 ]; then
         echo "Error: segment_floors.py failed for scene ${SCENE_ID}."
         return 1
+    fi
+
+    local PLY_ORIG="${SCENE_DIR}/${SCENE_ID}_pointcloud.ply"
+    if [ -f "$PLY_ORIG" ]; then
+        rm "$PLY_ORIG"
+        echo "Deleted ${PLY_ORIG}"
     fi
 
     return 0
