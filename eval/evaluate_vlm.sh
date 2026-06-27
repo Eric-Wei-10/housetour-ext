@@ -4,7 +4,7 @@
 #SBATCH --error=/cluster/project/cvg/students/xinwei/housetour-ext/eval/logs/evaluate_vlm_%j.err
 #SBATCH --chdir=/cluster/project/cvg/students/xinwei/housetour-ext
 #SBATCH --mem-per-cpu=16G
-#SBATCH --time=4:00:00
+#SBATCH --time=24:00:00
 #SBATCH --gpus=rtx_4090:1
 
 # Usage:

@@ -154,6 +154,9 @@ def eval_scene(scene_id: str, model, processor, device: str) -> None:
     if not smoothed_npy.exists():
         print(f"  [skip] no room_labels_smoothed.npy in {seg_dir}")
         return
+    if (seg_dir / "eval_vlm.json").exists():
+        print(f"  [skip] eval_vlm.json already exists in {seg_dir}")
+        return
 
     import numpy as np
     smoothed_labels = np.load(smoothed_npy)
