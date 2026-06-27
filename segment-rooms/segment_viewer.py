@@ -5,7 +5,7 @@ Renders camera frustums in 3D colored by segment ID.
 Click any frustum to preview the corresponding keyframe in the side panel.
 
 Usage:
-    python segment-rooms/viewer.py --scene_id 7 [--port 8080]
+    python segment-rooms/segment_viewer.py --scene_id 7 [--port 8080]
 
 Then open http://localhost:8080 in your browser.
 If running on a remote cluster (e.g. Euler), forward the port via jump host:
@@ -32,6 +32,8 @@ from scipy.sparse.csgraph import connected_components
 from scipy.spatial.transform import Rotation
 import viser
 
+from bbox_utils import detect_dominant_angle, find_bbox_at_angle
+
 HOUSE_ROOM_TYPES = [
     "living room", "bedroom", "bathroom", "kitchen", "dining room",
     "hallway", "office", "study", "garage", "laundry room",
@@ -57,6 +59,12 @@ parser.add_argument("--double_click_mode", default="dense",
                          "sparse: show the segment's points3D.bin points directly")
 parser.add_argument("--max_display_pts", type=int, default=1,
                     help="Max points in initial/reset view (0 = no limit)")
+parser.add_argument("--smooth_bbox", action="store_true",
+                    help="Draw bbox as smooth spline instead of straight lines")
+parser.add_argument("--min_obs", type=int, default=3,
+                    help="Min cameras observing a point globally (load-time filter)")
+parser.add_argument("--min_multi_view", type=int, default=3,
+                    help="Min frames in a segment observing a point (double-click filter)")
 args = parser.parse_args()
 
 SCENE_DIR = Path(args.data_root) / args.scene_id
@@ -129,10 +137,6 @@ def camera_center(qvec, tvec):
     R = Rotation.from_quat([qx, qy, qz, qw]).as_matrix()
     return -R.T @ tvec
 
-def hex_to_rgb(h):
-    h = h.lstrip("#")
-    return tuple(int(h[i:i+2], 16) for i in (0, 2, 4))
-
 def load_image_array(img_path, max_size=(640, 480)):
     try:
         img = Image.open(img_path).convert("RGB")
@@ -179,7 +183,7 @@ else:
         valid_pids = [pid for pid in ids
                       if pid in points3d
                       and points3d[pid][2] < 1.0    # reprojection error < 1px
-                      and points3d[pid][3] >= 3]     # observed by >= 3 cameras
+                      and points3d[pid][3] >= args.min_obs]
         if valid_pids:
             valid = [points3d[pid] for pid in valid_pids]
             name_to_sparse_pts[entry["name"]] = (
@@ -276,6 +280,8 @@ seg_to_names: dict[int, list[str]] = {}
 _sphere_handle = {"h": None}
 # handle for the segment centroid marker (double-click)
 _centroid_handle = {"h": None}
+# handle for the bbox lines in 3D (double-click)
+_bbox_handle = {"h": None}
 
 # --double_click_mode sparse: points within this radius are considered
 # spatially connected when finding the largest "near" cluster.
@@ -326,169 +332,81 @@ def _largest_cluster_mask(pts: np.ndarray, radius: float) -> np.ndarray:
 # double-click results accumulate here, keyed by segment_id, until reset
 _accumulated_segments: dict[int, tuple[np.ndarray, np.ndarray]] = {}
 
-DENSITY_OUT_DIR = SEG_DIR / "xz_density"
+DENSITY_OUT_DIR = SEG_DIR / "viewer_output"
 DENSITY_OUT_DIR.mkdir(parents=True, exist_ok=True)
 
 
-def _find_min_bbox_95(hist: np.ndarray, x_edges: np.ndarray, z_edges: np.ndarray,
-                       com_xz: np.ndarray, n_angles: int = 36,
-                       coverage: float = 0.95) -> tuple[np.ndarray, float] | None:
-    """Minimum-area oriented bbox covering *coverage* of the density, containing com_xz.
-
-    Each non-zero histogram bin becomes a weighted 2D point (weight = bin count).
-    For each of *n_angles* orientations in [0, pi), the algorithm rotates into an
-    axis-aligned frame and runs a two-level sliding-window search:
-      1. Outer: sweep left boundary along the primary axis (u), for each left
-         boundary enumerate right boundaries from the tightest valid one outward.
-      2. Inner: for the bins inside the u-range, sort by secondary axis (v) and
-         use vectorised searchsorted to find the narrowest v-interval whose
-         cumulative weight >= target and that contains the (rotated) CoM.
-    The combination with smallest area wins.
-
-    Returns (corners (4,2) in original XZ coords, area), or None.
-    """
-    nz_rows, nz_cols = np.nonzero(hist)
-    if len(nz_rows) < 4:
-        return None
-    x_c = 0.5 * (x_edges[nz_rows] + x_edges[nz_rows + 1])
-    z_c = 0.5 * (z_edges[nz_cols] + z_edges[nz_cols + 1])
-    w = hist[nz_rows, nz_cols].astype(np.float64)
-    pts = np.column_stack([x_c, z_c])
-
-    total_w = w.sum()
-    target_w = coverage * total_w
-    M = len(pts)
-
-    best_area = np.inf
-    best_info = None
-
-    for k in range(n_angles):
-        theta = np.pi * k / n_angles
-        ct, st = np.cos(theta), np.sin(theta)
-        R = np.array([[ct, st], [-st, ct]])
-        rot = pts @ R.T
-        com_r = com_xz @ R.T
-        cu, cv = float(com_r[0]), float(com_r[1])
-
-        u_order = np.argsort(rot[:, 0])
-        u_s = rot[u_order, 0]
-        v_s = rot[u_order, 1]
-        w_s = w[u_order]
-        cum_w = np.cumsum(w_s)
-
-        step_l = max(1, M // 30)
-        for l in range(0, M, step_l):
-            if u_s[l] > cu:
-                break
-            w_before = cum_w[l - 1] if l > 0 else 0.0
-            if cum_w[-1] - w_before < target_w:
-                break
-
-            r_min_w = int(np.searchsorted(cum_w, target_w + w_before, side="left"))
-            r_min_w = max(r_min_w, l)
-            r_min_cu = int(np.searchsorted(u_s, cu, side="left"))
-            r_start = max(r_min_w, r_min_cu)
-            if r_start >= M:
-                continue
-
-            step_r = max(1, (M - r_start) // 20)
-            for r in range(r_start, M, step_r):
-                u_lo, u_hi = u_s[l], u_s[r]
-                u_width = u_hi - u_lo
-
-                v_win = v_s[l:r + 1]
-                w_win = w_s[l:r + 1]
-                v_ord = np.argsort(v_win)
-                v_sorted = v_win[v_ord]
-                w_sorted = w_win[v_ord]
-                cum_w_v = np.cumsum(w_sorted)
-                n_v = len(v_sorted)
-
-                prev_cum = np.empty(n_v)
-                prev_cum[0] = 0.0
-                prev_cum[1:] = cum_w_v[:-1]
-                e_min = np.searchsorted(cum_w_v, target_w + prev_cum, side="left")
-
-                s_arr = np.arange(n_v)
-                valid_e = e_min < n_v
-                valid_s_cv = v_sorted <= cv
-                e_clamped = np.minimum(e_min, n_v - 1)
-                valid_e_cv = v_sorted[e_clamped] >= cv
-                valid = valid_e & valid_s_cv & valid_e_cv
-
-                if not valid.any():
-                    continue
-                v_ranges = v_sorted[e_min[valid]] - v_sorted[s_arr[valid]]
-                bi = v_ranges.argmin()
-                area = u_width * v_ranges[bi]
-                if area < best_area:
-                    best_area = area
-                    s_best = int(s_arr[valid][bi])
-                    e_best = int(e_min[valid][bi])
-                    best_info = (theta, float(u_lo), float(u_hi),
-                                 float(v_sorted[s_best]), float(v_sorted[e_best]))
-
-    if best_info is None:
-        return None
-    theta, u_lo, u_hi, v_lo, v_hi = best_info
-    ct, st = np.cos(theta), np.sin(theta)
-    R_inv = np.array([[ct, -st], [st, ct]])
-    corners_rot = np.array([[u_lo, v_lo], [u_hi, v_lo],
-                             [u_hi, v_hi], [u_lo, v_hi]])
-    return corners_rot @ R_inv.T, best_area
-
-
-def _save_xz_density(pts: np.ndarray, segment_id: int, bin_size: float = 0.05):
-    """Save a 2D density histogram of pts projected onto the XZ plane."""
+def _save_segment_bbox(pts: np.ndarray, segment_id: int, bin_size: float = 0.05
+                        ) -> np.ndarray | None:
+    """Compute and save bbox + density visualization. Returns bbox corners (4,2) or None."""
     if len(pts) == 0:
-        return
+        return None
     x, z = pts[:, 0], pts[:, 2]
-    x_bins = int(np.ceil((x.max() - x.min()) / bin_size)) + 1
-    z_bins = int(np.ceil((z.max() - z.min()) / bin_size)) + 1
-    x_bins = max(x_bins, 1)
-    z_bins = max(z_bins, 1)
-
+    x_bins = max(int(np.ceil((x.max() - x.min()) / bin_size)) + 1, 1)
+    z_bins = max(int(np.ceil((z.max() - z.min()) / bin_size)) + 1, 1)
     hist, x_edges, z_edges = np.histogram2d(x, z, bins=[x_bins, z_bins])
 
     com_x, com_z = float(x.mean()), float(z.mean())
     com_xz = np.array([com_x, com_z])
 
-    # Save histogram + edges (for offline bbox computation)
-    npz_path = DENSITY_OUT_DIR / f"seg_{segment_id}_xz_density.npz"
-    np.savez(npz_path, hist=hist, x_edges=x_edges, z_edges=z_edges)
-
-    # Compute 95% oriented bounding box
-    bbox_result = _find_min_bbox_95(hist, x_edges, z_edges, com_xz)
+    dominant_theta, skeleton = detect_dominant_angle(hist, x_edges, z_edges)
+    wall_dir_deg = float(np.rad2deg((dominant_theta + np.pi / 2) % np.pi))
+    bbox_result = find_bbox_at_angle(hist, x_edges, z_edges, com_xz, dominant_theta)
 
     meta = {"center_of_mass_x": com_x, "center_of_mass_z": com_z,
-            "n_points": len(pts)}
+            "n_points": len(pts),
+            "dominant_angle_rad": float(dominant_theta),
+            "wall_direction_deg": wall_dir_deg}
+    corners = None
     if bbox_result is not None:
         corners, area = bbox_result
         meta["bbox_corners"] = corners.tolist()
         meta["bbox_area"] = float(area)
-        print(f"  bbox: area={area:.3f} m², corners={corners.round(2).tolist()}")
+        print(f"  bbox: area={area:.3f} m², wall_dir={wall_dir_deg:.1f}°")
 
-    json_path = DENSITY_OUT_DIR / f"seg_{segment_id}_com.json"
+    json_path = DENSITY_OUT_DIR / f"seg_{segment_id}.json"
     with open(json_path, "w") as fp:
         json.dump(meta, fp, indent=2)
 
-    # Save visualization
-    fig, ax = plt.subplots(figsize=(8, 8))
+    # 2-panel visualisation (same layout as room_bbox.py)
+    fig, axes = plt.subplots(1, 2, figsize=(16, 8))
+
+    ax = axes[0]
     im = ax.imshow(hist.T, origin="lower", aspect="equal",
                    extent=[x_edges[0], x_edges[-1], z_edges[0], z_edges[-1]],
                    cmap="hot", interpolation="nearest")
     ax.plot(com_x, com_z, marker="+", color="cyan", markersize=14, markeredgewidth=2)
-    if bbox_result is not None:
+    if corners is not None:
         closed = np.vstack([corners, corners[0]])
         ax.plot(closed[:, 0], closed[:, 1], "-", color="cyan", linewidth=2)
     ax.set_xlabel("X")
     ax.set_ylabel("Z")
-    ax.set_title(f"Segment {segment_id} — XZ density (bin={bin_size}m)")
+    ax.set_title(f"Seg {segment_id} — density + bbox")
     fig.colorbar(im, ax=ax, label="Point count")
-    png_path = DENSITY_OUT_DIR / f"seg_{segment_id}_xz_density.png"
+
+    ax = axes[1]
+    im2 = ax.imshow(skeleton.T.astype(float), origin="lower", aspect="equal",
+                    extent=[x_edges[0], x_edges[-1], z_edges[0], z_edges[-1]],
+                    cmap="gray", interpolation="nearest")
+    wall_dx = np.cos(dominant_theta + np.pi / 2)
+    wall_dz = np.sin(dominant_theta + np.pi / 2)
+    line_len = max(x_edges[-1] - x_edges[0], z_edges[-1] - z_edges[0]) * 0.6
+    ax.plot([com_x - wall_dx * line_len, com_x + wall_dx * line_len],
+            [com_z - wall_dz * line_len, com_z + wall_dz * line_len],
+            "-", color="cyan", linewidth=2, label=f"wall dir {wall_dir_deg:.0f}°")
+    ax.plot(com_x, com_z, marker="+", color="red", markersize=14, markeredgewidth=2)
+    ax.legend(loc="upper right")
+    ax.set_xlabel("X")
+    ax.set_ylabel("Z")
+    ax.set_title(f"Seg {segment_id} — skeleton (top 20%)")
+    fig.colorbar(im2, ax=ax, label="Skeleton")
+
+    fig.tight_layout()
+    png_path = DENSITY_OUT_DIR / f"seg_{segment_id}.png"
     fig.savefig(png_path, dpi=150, bbox_inches="tight")
     plt.close(fig)
-    print(f"  XZ density saved: {npz_path.name}, {png_path.name}, CoM=({com_x:.3f}, {com_z:.3f})")
+    print(f"  saved: {json_path.name}, {png_path.name}")
+    return corners
 
 def _show_points_for_frames(frame_names: list[str], is_segment: bool = False,
                              segment_id: int | None = None):
@@ -496,7 +414,7 @@ def _show_points_for_frames(frame_names: list[str], is_segment: bool = False,
 
     is_segment=False (single-click): show one frame's sparse points directly.
     is_segment=True  (double-click): show the whole segment's points.
-      - First filters to points observed by >=2 frames (multi-view filter).
+      - First filters to points observed by >= min_multi_view frames.
       - Then depending on --double_click_mode:
           dense:  find nearby dense PLY points via voxel-grid lookup.
           sparse: keep only the largest spatial cluster (drop outliers).
@@ -515,10 +433,10 @@ def _show_points_for_frames(frame_names: list[str], is_segment: bool = False,
         # Multi-view filter: keep only points seen by >= 2 frames in this segment
         all_pids = np.concatenate([name_to_sparse_pts[n][2] for n in valid_names])
         uniq_pids, first_idx, counts = np.unique(all_pids, return_index=True, return_counts=True)
-        multi = counts >= 3
+        multi = counts >= args.min_multi_view
         all_pts  = all_pts[first_idx[multi]]
         all_clrs = all_clrs[first_idx[multi]]
-        print(f"  multi-view filter: {multi.sum()}/{len(uniq_pids)} unique pts seen by >=3 frames")
+        print(f"  multi-view filter: {multi.sum()}/{len(uniq_pids)} unique pts seen by >={args.min_multi_view} frames")
 
     if is_segment and args.double_click_mode == "dense" \
             and pcd_loaded and _vox_sorted_packed is not None:
@@ -565,7 +483,27 @@ def _show_points_for_frames(frame_names: list[str], is_segment: bool = False,
         _centroid_handle["h"] = server.scene.add_icosphere(
             name="/centroid", radius=0.15,
             color=(0, 200, 255), position=tuple(centroid))
-        _save_xz_density(shown_pts, segment_id)
+        bbox_corners = _save_segment_bbox(shown_pts, segment_id)
+
+        # Draw bbox as lines in the 3D scene (on XZ plane at centroid Y)
+        if _bbox_handle["h"] is not None:
+            _bbox_handle["h"].remove()
+            _bbox_handle["h"] = None
+        if bbox_corners is not None:
+            y_val = centroid[1]
+            corners_3d = np.array([[bbox_corners[i, 0], y_val, bbox_corners[i, 1]]
+                                   for i in range(4)])
+            if args.smooth_bbox:
+                closed = np.vstack([corners_3d, corners_3d[0:1]])
+                _bbox_handle["h"] = server.scene.add_spline_catmull_rom(
+                    name="/bbox", positions=closed,
+                    color=(0, 200, 255), line_width=3.0)
+            else:
+                starts = corners_3d[[0, 1, 2, 3]]
+                ends = corners_3d[[1, 2, 3, 0]]
+                _bbox_handle["h"] = server.scene.add_line_segments(
+                    name="/bbox", points=np.stack([starts, ends], axis=1),
+                    colors=(0, 200, 255), line_width=3.0)
 
 def _reset_points():
     _accumulated_segments.clear()
@@ -578,6 +516,9 @@ def _reset_points():
     if _centroid_handle["h"] is not None:
         _centroid_handle["h"].remove()
         _centroid_handle["h"] = None
+    if _bbox_handle["h"] is not None:
+        _bbox_handle["h"].remove()
+        _bbox_handle["h"] = None
 
 for i, entry in enumerate(entries):
     sid = name_to_seg.get(entry["name"], -1)

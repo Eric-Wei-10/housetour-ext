@@ -1,18 +1,18 @@
 #!/bin/bash
-#SBATCH --job-name=export_xz_density
-#SBATCH --output=/cluster/project/cvg/students/xinwei/housetour-ext/segment-rooms/logs/export_xz_density_%j.out
-#SBATCH --error=/cluster/project/cvg/students/xinwei/housetour-ext/segment-rooms/logs/export_xz_density_%j.err
+#SBATCH --job-name=room_bbox
+#SBATCH --output=/cluster/project/cvg/students/xinwei/housetour-ext/segment-rooms/logs/room_bbox_%j.out
+#SBATCH --error=/cluster/project/cvg/students/xinwei/housetour-ext/segment-rooms/logs/room_bbox_%j.err
 #SBATCH --chdir=/cluster/project/cvg/students/xinwei/housetour-ext
 #SBATCH --cpus-per-task=4
 #SBATCH --mem-per-cpu=8G
 #SBATCH --time=4:00:00
 
 # Usage:
-#   Single scene  : sbatch ./segment-rooms/export_xz_density.sh 7
-#   Several scenes: sbatch ./segment-rooms/export_xz_density.sh 7 14 1002
-#   Range         : sbatch ./segment-rooms/export_xz_density.sh 100-200
-#   Mixed         : sbatch ./segment-rooms/export_xz_density.sh 7 100-200 1624
-#   With options  : sbatch ./segment-rooms/export_xz_density.sh 7 14 --mode sparse
+#   Single scene  : sbatch ./segment-rooms/room_bbox.sh 7
+#   Several scenes: sbatch ./segment-rooms/room_bbox.sh 7 14 1002
+#   Range         : sbatch ./segment-rooms/room_bbox.sh 100-200
+#   Mixed         : sbatch ./segment-rooms/room_bbox.sh 7 100-200 1624
+#   With options  : sbatch ./segment-rooms/room_bbox.sh 7 14 --mode sparse --density_percentile 70
 
 module load stack/2024-06
 module load cuda/12.4
@@ -29,7 +29,7 @@ mkdir -p "$SCRIPT_DIR/logs"
 SCENE_IDS=()
 SCRIPT_ARGS=()
 
-KNOWN_FLAGS=(--mode --bin_size --coverage --min_multi_view --data_root --seg_root)
+KNOWN_FLAGS=(--mode --bin_size --coverage --min_multi_view --density_percentile --data_root --seg_root)
 
 args=("$@")
 i=0
@@ -63,15 +63,15 @@ if [ ${#SCENE_IDS[@]} -eq 0 ]; then
     echo "Error: no scene IDs provided."
     echo ""
     echo "Usage:"
-    echo "  Single scene  : sbatch ./segment-rooms/export_xz_density.sh 7"
-    echo "  Several scenes: sbatch ./segment-rooms/export_xz_density.sh 7 14 1002"
-    echo "  Range         : sbatch ./segment-rooms/export_xz_density.sh 100-200"
-    echo "  Mixed         : sbatch ./segment-rooms/export_xz_density.sh 7 100-200 1624"
-    echo "  With options  : sbatch ./segment-rooms/export_xz_density.sh 7 14 --mode sparse"
+    echo "  Single scene  : sbatch ./segment-rooms/room_bbox.sh 7"
+    echo "  Several scenes: sbatch ./segment-rooms/room_bbox.sh 7 14 1002"
+    echo "  Range         : sbatch ./segment-rooms/room_bbox.sh 100-200"
+    echo "  Mixed         : sbatch ./segment-rooms/room_bbox.sh 7 100-200 1624"
+    echo "  With options  : sbatch ./segment-rooms/room_bbox.sh 7 14 --mode sparse"
     exit 1
 fi
 
-echo "=== export_xz_density ==="
+echo "=== room_bbox ==="
 echo "Scenes   : ${SCENE_IDS[*]}"
 echo "N scenes : ${#SCENE_IDS[@]}"
 [ ${#SCRIPT_ARGS[@]} -gt 0 ] && echo "Options  : ${SCRIPT_ARGS[*]}"
@@ -81,7 +81,7 @@ echo ""
 FAIL=0
 for SID in "${SCENE_IDS[@]}"; do
     echo "--- scene $SID ---"
-    python "$SCRIPT_DIR/export_xz_density.py" \
+    python "$SCRIPT_DIR/room_bbox.py" \
         --scene_id "$SID" \
         "${SCRIPT_ARGS[@]}"
     RC=$?

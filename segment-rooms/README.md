@@ -6,14 +6,8 @@ type and splits the sequence into per-room segments.
 ## Pipeline
 
 ```
-                 ┌─ refine_vlm      (approach A)
-segment_rooms  ──┤
-                 └─ probe_multi_bed (approach B)
+segment_rooms  ── probe_multi_bed ── room_bbox
 ```
-
-`refine_vlm` and `probe_multi_bed` are two independent approaches to the same
-problem — splitting under-segmented adjacent bedrooms. They are being evaluated
-in parallel; only one will be used in the final pipeline.
 
 ### 1. `segment_rooms.py` / `segment_rooms.sh`
 
@@ -40,30 +34,7 @@ sbatch ./segment-rooms/segment_rooms.sh 100-200
 sbatch ./segment-rooms/segment_rooms.sh 11 100-200 --batch_size 64
 ```
 
-### 2. `refine_vlm.py` / `refine_vlm.sh`
-
-VLM-based post-processing that detects and splits under-segmented bedroom segments.
-Uses Qwen2.5-VL-7B with the prior that each bedroom contains exactly one unique bed.
-
-For each bedroom segment:
-1. Filter all frames to those where a bed is clearly visible (one frame at a time).
-2. Evenly sample up to `n_frames` bed-visible frames, preserving temporal order.
-3. Ask the VLM whether all sampled frames show the **same** bed.
-4. If different, ask where the bed first changes and split there (midpoint between
-   the last old-bed sample and the first new-bed sample).
-5. Recurse up to `max_depth` levels.
-
-Modifies `segments.json` in-place. Sub-segment IDs follow the pattern
-`5 → 5_0, 5_1 → 5_0_0, 5_0_1`, etc.
-
-```bash
-sbatch ./segment-rooms/refine_vlm.sh 14
-sbatch ./segment-rooms/refine_vlm.sh 11 14 1002
-sbatch ./segment-rooms/refine_vlm.sh 100-200
-sbatch ./segment-rooms/refine_vlm.sh 14 --n_frames 12 --dry_run
-```
-
-### 3. `probe_multi_bed.py` / `probe_multi_bed.sh`
+### 2. `probe_multi_bed.py` / `probe_multi_bed.sh`
 
 Second-pass bedroom post-processing. The SigLIP pipeline often fails to separate
 two adjacent bedrooms, merging them into one segment. This script uses
@@ -86,22 +57,57 @@ sbatch ./segment-rooms/probe_multi_bed.sh 7 --out_dir /tmp/probe
 sbatch ./segment-rooms/probe_multi_bed.sh 1-200 --out_dir /tmp/probe
 ```
 
+### 3. `room_bbox.py` / `room_bbox.sh`
+
+Offline batch export of oriented room bounding boxes for all segments in a scene.
+
+Per segment:
+1. Build XZ density histogram from filtered 3D points (multi-view filter → dense/sparse mode).
+2. Threshold histogram to top 20% density bins → wall skeleton.
+3. Radon-like projection on skeleton → detect dominant wall orientation.
+4. Fix bbox orientation to the detected wall direction, find minimum-area rectangle
+   covering 95% of total point weight, constrained to contain the center of mass.
+
+**Outputs** (per scene under `label_segments/<scene_id>/room_bbox/`):
+
+| File | Description |
+|---|---|
+| `seg_<id>.json` | CoM, dominant wall angle, bbox corners + area |
+| `seg_<id>.png` | 2-panel figure: density+bbox / skeleton+direction line |
+
+```bash
+sbatch ./segment-rooms/room_bbox.sh 7
+sbatch ./segment-rooms/room_bbox.sh 1-50
+sbatch ./segment-rooms/room_bbox.sh 7 14 --mode sparse --density_percentile 70
+```
+
+### 4. `export_xz_density.py` / `export_xz_density.sh`
+
+Offline batch export of XZ density histograms with uniform-angle bbox search
+(36 orientations, no wall detection). Predecessor to `room_bbox.py`.
+
+```bash
+sbatch ./segment-rooms/export_xz_density.sh 7
+sbatch ./segment-rooms/export_xz_density.sh 1-50
+```
+
 ## Viewer
 
-### `viewer.py`
+### `segment_viewer.py`
 
 Interactive 3D segment viewer built with [viser](https://viser.studio). Renders
 one camera frustum per keyframe, coloured by segment ID. Click a frustum to
-preview the corresponding keyframe image.
-
-> **Note:** The point-cloud highlight on frustum click uses pinhole projection
-> with an approximate Z-buffer (depth buffer + dilation) to suppress occluded
-> points. Occlusion culling is approximate — sparse areas of the point cloud
-> may still let some behind-wall points through.
+preview the corresponding keyframe image. Double-click a frustum to show the
+segment's filtered point cloud and compute a wall-aligned bounding box (same
+algorithm as `room_bbox.py`).
 
 ```bash
-python segment-rooms/viewer.py --scene_id 7 [--port 8080] [--every_n 2]
+python segment-rooms/segment_viewer.py --scene_id 7 [--port 8080] [--every_n 2]
+python segment-rooms/segment_viewer.py --scene_id 7 --smooth_bbox
+python segment-rooms/segment_viewer.py --scene_id 7 --min_obs 2 --min_multi_view 2
 ```
+
+Online outputs are saved to `label_segments/<scene_id>/viewer_output/`.
 
 If running on a remote cluster:
 ```bash
@@ -112,6 +118,7 @@ ssh -L 8080:localhost:8080 -J <user>@euler.ethz.ch <user>@<compute-node>
 
 | File | Role |
 |---|---|
+| `bbox_utils.py` | Shared bbox logic: `detect_dominant_angle`, `find_bbox_at_angle` |
 | `siglip.py` | SigLIP model loading, feature extraction, room classification |
 | `utils.py` | COLMAP `images.bin` reader |
 | `visualization.py` | Segment grid, similarity matrix, per-frame overlay figures |

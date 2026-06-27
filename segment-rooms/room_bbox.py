@@ -1,13 +1,16 @@
 """
-Batch-export XZ density maps, center-of-mass, and oriented bounding boxes
-for all segments in a scene.
+Export room bounding boxes using dominant wall-direction detection.
 
-Replicates the viewer's double-click pipeline (multi-view filter → dense/sparse
-point extraction → histogram → bbox) but runs offline without viser.
+Pipeline per segment:
+  1. Build XZ density histogram (same as export_xz_density.py)
+  2. Threshold to top-K% density bins → wall skeleton
+  3. Radon-like projection on skeleton → dominant wall angle θ
+  4. Fix bbox orientation to θ, find minimum-area bbox covering 95% of weight
 
 Usage:
-    python segment-rooms/export_xz_density.py --scene_id 7
-    python segment-rooms/export_xz_density.py --scene_id 7 --mode sparse
+    python segment-rooms/room_bbox.py --scene_id 7
+    python segment-rooms/room_bbox.py --scene_id 7 --mode sparse
+    python segment-rooms/room_bbox.py --scene_id 7 --density_percentile 80
 """
 
 import argparse
@@ -21,6 +24,8 @@ import matplotlib.pyplot as plt
 import numpy as np
 from scipy.sparse import coo_matrix
 from scipy.sparse.csgraph import connected_components
+
+from bbox_utils import detect_dominant_angle, find_bbox_at_angle
 
 # ---------------------------------------------------------------------------
 # Args
@@ -40,13 +45,15 @@ parser.add_argument("--coverage", type=float, default=0.95,
                     help="Fraction of points the bbox must cover")
 parser.add_argument("--min_multi_view", type=int, default=3,
                     help="Keep only points seen by >= this many frames in a segment")
+parser.add_argument("--density_percentile", type=float, default=80,
+                    help="Percentile threshold for wall skeleton (e.g. 80 = top 20%%)")
 args = parser.parse_args()
 
 SCENE_DIR = Path(args.data_root) / args.scene_id
 SEG_DIR = Path(args.seg_root) / args.scene_id
 IMAGES_BIN = SCENE_DIR / "0_metric" / "images.bin"
 POINTS3D_BIN = IMAGES_BIN.parent / "points3D.bin"
-OUT_DIR = SEG_DIR / "xz_density"
+OUT_DIR = SEG_DIR / "room_bbox"
 OUT_DIR.mkdir(parents=True, exist_ok=True)
 
 # ---------------------------------------------------------------------------
@@ -168,106 +175,9 @@ def _largest_cluster_mask(pts: np.ndarray, radius: float) -> np.ndarray:
     return vox_labels[point_vox] == largest
 
 
-# ---------------------------------------------------------------------------
-# Bbox: oriented search
-# ---------------------------------------------------------------------------
-def find_min_bbox(hist: np.ndarray, x_edges: np.ndarray, z_edges: np.ndarray,
-                  com_xz: np.ndarray, n_angles: int = 36,
-                  coverage: float = 0.95) -> tuple[np.ndarray, float] | None:
-    """Minimum-area oriented bbox covering *coverage* of the density, containing com_xz.
-
-    For each of *n_angles* orientations in [0, pi), rotates into an axis-aligned
-    frame and runs a two-level sliding-window search.
-    """
-    nz_rows, nz_cols = np.nonzero(hist)
-    if len(nz_rows) < 4:
-        return None
-    x_c = 0.5 * (x_edges[nz_rows] + x_edges[nz_rows + 1])
-    z_c = 0.5 * (z_edges[nz_cols] + z_edges[nz_cols + 1])
-    w = hist[nz_rows, nz_cols].astype(np.float64)
-    pts = np.column_stack([x_c, z_c])
-    total_w = w.sum()
-    target_w = coverage * total_w
-    M = len(pts)
-
-    best_area = np.inf
-    best_info = None
-
-    for k in range(n_angles):
-        theta = np.pi * k / n_angles
-        ct, st = np.cos(theta), np.sin(theta)
-        R = np.array([[ct, st], [-st, ct]])
-        rot = pts @ R.T
-        com_r = com_xz @ R.T
-        cu, cv = float(com_r[0]), float(com_r[1])
-
-        u_order = np.argsort(rot[:, 0])
-        u_s = rot[u_order, 0]
-        v_s = rot[u_order, 1]
-        w_s = w[u_order]
-        cum_w = np.cumsum(w_s)
-
-        step_l = max(1, M // 30)
-        for l in range(0, M, step_l):
-            if u_s[l] > cu:
-                break
-            w_before = cum_w[l - 1] if l > 0 else 0.0
-            if cum_w[-1] - w_before < target_w:
-                break
-            r_min_w = int(np.searchsorted(cum_w, target_w + w_before, side="left"))
-            r_min_w = max(r_min_w, l)
-            r_min_cu = int(np.searchsorted(u_s, cu, side="left"))
-            r_start = max(r_min_w, r_min_cu)
-            if r_start >= M:
-                continue
-            step_r = max(1, (M - r_start) // 20)
-            for r in range(r_start, M, step_r):
-                u_lo, u_hi = u_s[l], u_s[r]
-                u_width = u_hi - u_lo
-                v_win = v_s[l:r + 1]
-                w_win = w_s[l:r + 1]
-                v_ord = np.argsort(v_win)
-                v_sorted = v_win[v_ord]
-                w_sorted = w_win[v_ord]
-                cum_w_v = np.cumsum(w_sorted)
-                n_v = len(v_sorted)
-                prev_cum = np.empty(n_v)
-                prev_cum[0] = 0.0
-                prev_cum[1:] = cum_w_v[:-1]
-                e_min = np.searchsorted(cum_w_v, target_w + prev_cum, side="left")
-                s_arr = np.arange(n_v)
-                valid_e = e_min < n_v
-                valid_s_cv = v_sorted <= cv
-                e_clamped = np.minimum(e_min, n_v - 1)
-                valid_e_cv = v_sorted[e_clamped] >= cv
-                valid = valid_e & valid_s_cv & valid_e_cv
-                if not valid.any():
-                    continue
-                v_ranges = v_sorted[e_min[valid]] - v_sorted[s_arr[valid]]
-                bi = v_ranges.argmin()
-                area = u_width * v_ranges[bi]
-                if area < best_area:
-                    best_area = area
-                    s_best = int(s_arr[valid][bi])
-                    e_best = int(e_min[valid][bi])
-                    best_info = (theta, float(u_lo), float(u_hi),
-                                 float(v_sorted[s_best]), float(v_sorted[e_best]))
-
-    if best_info is None:
-        return None
-    theta, u_lo, u_hi, v_lo, v_hi = best_info
-    ct, st = np.cos(theta), np.sin(theta)
-    R_inv = np.array([[ct, -st], [st, ct]])
-    corners_rot = np.array([[u_lo, v_lo], [u_hi, v_lo],
-                             [u_hi, v_hi], [u_lo, v_hi]])
-    return corners_rot @ R_inv.T, best_area
-
-
-# ---------------------------------------------------------------------------
-# Density export
-# ---------------------------------------------------------------------------
-def save_xz_density(pts: np.ndarray, segment_id: int, out_dir: Path,
-                    bin_size: float = 0.05, coverage: float = 0.95):
+def save_room_bbox(pts: np.ndarray, segment_id: int, out_dir: Path,
+                   bin_size: float = 0.05, coverage: float = 0.95,
+                   density_percentile: float = 80):
     if len(pts) == 0:
         print(f"  [seg {segment_id}] no points, skipping")
         return
@@ -279,41 +189,75 @@ def save_xz_density(pts: np.ndarray, segment_id: int, out_dir: Path,
     com_x, com_z = float(x.mean()), float(z.mean())
     com_xz = np.array([com_x, com_z])
 
-    npz_path = out_dir / f"seg_{segment_id}_xz_density.npz"
-    np.savez(npz_path, hist=hist, x_edges=x_edges, z_edges=z_edges)
+    # Step 1: detect dominant angle from wall skeleton
+    dominant_theta, skeleton = detect_dominant_angle(
+        hist, x_edges, z_edges, density_percentile=density_percentile)
+    wall_dir_deg = float(np.rad2deg((dominant_theta + np.pi / 2) % np.pi))
+    print(f"  [seg {segment_id}] dominant wall direction: {wall_dir_deg:.1f}°"
+          f"  (skeleton bins: {int(skeleton.sum())}/{int((hist > 0).sum())})")
 
-    bbox_result = find_min_bbox(hist, x_edges, z_edges, com_xz, coverage=coverage)
+    # Step 2: find bbox at that orientation
+    bbox_result = find_bbox_at_angle(hist, x_edges, z_edges, com_xz,
+                                     dominant_theta, coverage=coverage)
 
     meta = {"center_of_mass_x": com_x, "center_of_mass_z": com_z,
-            "n_points": len(pts)}
+            "n_points": len(pts),
+            "dominant_angle_rad": float(dominant_theta),
+            "wall_direction_deg": wall_dir_deg,
+            "density_percentile": density_percentile}
     if bbox_result is not None:
         corners, area = bbox_result
         meta["bbox_corners"] = corners.tolist()
         meta["bbox_area"] = float(area)
         print(f"  [seg {segment_id}] bbox area={area:.3f} m²")
     else:
+        corners = None
         print(f"  [seg {segment_id}] bbox search returned None")
 
-    json_path = out_dir / f"seg_{segment_id}_com.json"
+    json_path = out_dir / f"seg_{segment_id}.json"
     with open(json_path, "w") as fp:
         json.dump(meta, fp, indent=2)
 
-    fig, ax = plt.subplots(figsize=(8, 8))
+    # --- Visualisation: 2-panel figure ---
+    fig, axes = plt.subplots(1, 2, figsize=(16, 8))
+
+    # Left: density map + bbox
+    ax = axes[0]
     im = ax.imshow(hist.T, origin="lower", aspect="equal",
                    extent=[x_edges[0], x_edges[-1], z_edges[0], z_edges[-1]],
                    cmap="hot", interpolation="nearest")
     ax.plot(com_x, com_z, marker="+", color="cyan", markersize=14, markeredgewidth=2)
-    if bbox_result is not None:
+    if corners is not None:
         closed = np.vstack([corners, corners[0]])
         ax.plot(closed[:, 0], closed[:, 1], "-", color="cyan", linewidth=2)
     ax.set_xlabel("X")
     ax.set_ylabel("Z")
-    ax.set_title(f"Segment {segment_id} — XZ density (bin={bin_size}m)")
+    ax.set_title(f"Seg {segment_id} — density + bbox")
     fig.colorbar(im, ax=ax, label="Point count")
-    png_path = out_dir / f"seg_{segment_id}_xz_density.png"
+
+    # Right: wall skeleton + dominant direction line
+    ax = axes[1]
+    im2 = ax.imshow(skeleton.T.astype(float), origin="lower", aspect="equal",
+                    extent=[x_edges[0], x_edges[-1], z_edges[0], z_edges[-1]],
+                    cmap="gray", interpolation="nearest")
+    wall_dx = np.cos(dominant_theta + np.pi / 2)
+    wall_dz = np.sin(dominant_theta + np.pi / 2)
+    line_len = max(x_edges[-1] - x_edges[0], z_edges[-1] - z_edges[0]) * 0.6
+    ax.plot([com_x - wall_dx * line_len, com_x + wall_dx * line_len],
+            [com_z - wall_dz * line_len, com_z + wall_dz * line_len],
+            "-", color="cyan", linewidth=2, label=f"wall dir {wall_dir_deg:.0f}°")
+    ax.plot(com_x, com_z, marker="+", color="red", markersize=14, markeredgewidth=2)
+    ax.legend(loc="upper right")
+    ax.set_xlabel("X")
+    ax.set_ylabel("Z")
+    ax.set_title(f"Seg {segment_id} — skeleton (top {100 - density_percentile:.0f}%)")
+    fig.colorbar(im2, ax=ax, label="Skeleton")
+
+    fig.tight_layout()
+    png_path = out_dir / f"seg_{segment_id}.png"
     fig.savefig(png_path, dpi=150, bbox_inches="tight")
     plt.close(fig)
-    print(f"  [seg {segment_id}] saved {npz_path.name}, {png_path.name}")
+    print(f"  [seg {segment_id}] saved {json_path.name}, {png_path.name}")
 
 
 # ---------------------------------------------------------------------------
@@ -326,9 +270,9 @@ def main():
     if not seg_json.exists():
         return
 
-    print(f"Scene {args.scene_id} — mode={args.mode}")
+    print(f"Scene {args.scene_id} — mode={args.mode}, "
+          f"density_percentile={args.density_percentile}")
 
-    # Load COLMAP
     print("Loading images.bin ...")
     entries = read_images_bin(IMAGES_BIN)
     print(f"  {len(entries)} registered frames")
@@ -337,7 +281,6 @@ def main():
     points3d = read_points3d_bin(POINTS3D_BIN)
     print(f"  {len(points3d)} 3D points")
 
-    # Per-frame sparse points (quality-filtered)
     name_to_sparse: dict[str, tuple[np.ndarray, np.ndarray, np.ndarray]] = {}
     for entry in entries:
         ids = entry.get("point3d_ids") or []
@@ -354,9 +297,7 @@ def main():
             )
     print(f"  {len(name_to_sparse)} frames have sparse observations")
 
-    # Dense PLY + voxel index (for dense mode)
     dense_pts = None
-    dense_clrs = None
     vox_sorted_packed = None
     vox_sort_order = None
     if args.mode == "dense":
@@ -366,48 +307,36 @@ def main():
             print(f"Loading dense PLY: {ply_path.name} ...")
             pcd = o3d.io.read_point_cloud(str(ply_path))
             dense_pts = np.asarray(pcd.points, dtype=np.float64)
-            dense_clrs = ((np.asarray(pcd.colors) * 255).astype(np.uint8)
-                          if pcd.has_colors()
-                          else np.full((len(dense_pts), 3), 180, dtype=np.uint8))
             print(f"  {len(dense_pts)} dense points, building voxel index ...")
             vox_sorted_packed, vox_sort_order = _build_voxel_index(dense_pts)
             print("  done")
         else:
             print(f"  [warn] {ply_path.name} not found, falling back to sparse")
 
-    # Load segments
     with open(seg_json) as f:
         segments = json.load(f)
     print(f"  {len(segments)} segments\n")
 
-    # Process each segment
     for seg in segments:
         sid = seg["segment_id"]
         frame_names = seg["frame_names"]
         valid_names = [n for n in frame_names if n in name_to_sparse]
         if not valid_names:
-            print(f"  [seg {sid}] no valid frames with sparse pts, skipping")
+            print(f"  [seg {sid}] no valid frames, skipping")
             continue
 
-        # Gather sparse points
         all_pts = np.concatenate([name_to_sparse[n][0] for n in valid_names])
-        all_clrs = np.concatenate([name_to_sparse[n][1] for n in valid_names])
         all_pids = np.concatenate([name_to_sparse[n][2] for n in valid_names])
 
-        # Multi-view filter
         uniq_pids, first_idx, counts = np.unique(
             all_pids, return_index=True, return_counts=True)
         multi = counts >= args.min_multi_view
         sparse_pts = all_pts[first_idx[multi]]
-        sparse_clrs = all_clrs[first_idx[multi]]
-        print(f"  [seg {sid}] multi-view: {multi.sum()}/{len(uniq_pids)} pts "
-              f"(>={args.min_multi_view} frames)")
+        print(f"  [seg {sid}] multi-view: {multi.sum()}/{len(uniq_pids)} pts")
 
         if len(sparse_pts) == 0:
-            print(f"  [seg {sid}] no points after multi-view filter, skipping")
             continue
 
-        # Dense or sparse mode
         if args.mode == "dense" and vox_sorted_packed is not None:
             dense_idx = _dense_near_sparse(sparse_pts, vox_sorted_packed, vox_sort_order)
             print(f"  [seg {sid}] dense: {len(sparse_pts)} sparse → {len(dense_idx)} dense")
@@ -421,8 +350,9 @@ def main():
         else:
             shown_pts = sparse_pts
 
-        save_xz_density(shown_pts, sid, OUT_DIR,
-                         bin_size=args.bin_size, coverage=args.coverage)
+        save_room_bbox(shown_pts, sid, OUT_DIR,
+                       bin_size=args.bin_size, coverage=args.coverage,
+                       density_percentile=args.density_percentile)
 
     print(f"\nDone. Output in {OUT_DIR}")
 
